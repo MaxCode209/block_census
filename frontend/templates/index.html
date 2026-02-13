@@ -11,7 +11,7 @@
     <div class="container">
         <header>
             <h1>Real Estate Site Selection Tool</h1>
-            <p>Census Data Visualization by Zip Code</p>
+            <p>Census Data Visualization (Block Groups & Zip Codes)</p>
         </header>
         
         <div class="main-content">
@@ -53,7 +53,7 @@
                     
                     <label class="layer-toggle">
                         <input type="checkbox" id="layer-boundaries" checked>
-                        <span>Zip Code Boundaries</span>
+                        <span>Census Block / Zip Boundaries</span>
                     </label>
                     <label class="layer-toggle">
                         <input type="checkbox" id="layer-school-districts">
@@ -78,7 +78,7 @@
                 
                 <div class="data-layer-filters">
                     <h3>Filter by Criteria</h3>
-                    <p class="search-hint" style="margin-bottom: 8px;">Only zips meeting all minimums are shown</p>
+                    <p class="search-hint" style="margin-bottom: 8px;">Only block groups / zips meeting all minimums are shown</p>
                     <div class="filter-group">
                         <label for="filter-pop-min">Population min:</label>
                         <input type="number" id="filter-pop-min" placeholder="e.g. 10000" min="0" step="1000" style="width: 100%; padding: 4px 8px; box-sizing: border-box;">
@@ -139,7 +139,8 @@
                 </div>
                 
                 <div class="school-scores-section" id="school-scores-section" style="display: none;">
-                    <h3>School Scores</h3>
+                    <h3>Zoned Schools</h3>
+                    <p class="search-hint" id="school-scores-subtitle" style="font-size:0.8em;margin-top:-4px;margin-bottom:8px;">Address-based attendance zones (NC/SC)</p>
                     <div id="school-scores-content">
                         <div class="school-score-item">
                             <strong>Elementary:</strong> <span id="elementary-score">-</span>/10

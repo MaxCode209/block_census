@@ -4,6 +4,7 @@ let markers = [];
 let heatmapLayer = null;
 let zipCodePolygons = []; // Store zip code boundary polygons
 let schoolDistrictPolygons = []; // School district overlay (NCES, for current zip)
+let schoolDistrictPolylines = []; // Explicit perimeter lines for each boundary
 let schoolDistrictLabels = [];   // Number labels for each attendance zone
 let selectedPolygon = null; // Currently selected/highlighted zip code
 let currentData = [];
@@ -38,7 +39,12 @@ function initMap() {
     loadCensusData();
 }
 
-// Load census data from API
+// Use census block groups when we have a geographic search (city, zip, or lat/lng)
+function useBlockGroups(filters) {
+    return !!(filters && (filters.city || filters.zip_code || (filters.lat != null && filters.lng != null)));
+}
+
+// Load census data from API - uses block groups for city/zip/address search, zips otherwise
 async function loadCensusData(filters = {}) {
     try {
         showLoading(true);
@@ -50,6 +56,8 @@ async function loadCensusData(filters = {}) {
         if (filters.zip_code) params.append('zip_code', filters.zip_code);
         if (filters.city) params.append('city', filters.city);
         if (filters.state) params.append('state', filters.state);
+        if (filters.lat != null) params.append('lat', filters.lat);
+        if (filters.lng != null) params.append('lng', filters.lng);
         if (filters.min_income) params.append('min_income', filters.min_income);
         if (filters.max_income) params.append('max_income', filters.max_income);
         if (filters.min_population) params.append('min_population', filters.min_population);
@@ -59,10 +67,32 @@ async function loadCensusData(filters = {}) {
         if (filters.min_employment_rating != null && filters.min_employment_rating !== '' && !Number.isNaN(Number(filters.min_employment_rating))) params.append('min_employment_rating', filters.min_employment_rating);
         if (filters.min_elementary_school_rating != null && filters.min_elementary_school_rating !== '' && !Number.isNaN(Number(filters.min_elementary_school_rating))) params.append('min_elementary_school_rating', filters.min_elementary_school_rating);
         if (filters.min_blended_school_rating != null && filters.min_blended_school_rating !== '' && !Number.isNaN(Number(filters.min_blended_school_rating))) params.append('min_blended_school_rating', filters.min_blended_school_rating);
-        params.append('limit', '5000'); // Adjust as needed
+        params.append('limit', '5000');
         
-        const response = await fetch(`${API_BASE_URL}/census-data?${params}`);
-        const result = await response.json().catch(() => ({}));
+        let endpoint = useBlockGroups(filters) ? 'census-block-groups' : 'census-data';
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
+        let response, result;
+        try {
+            response = await fetch(`${API_BASE_URL}/${endpoint}?${params}`, { signal: controller.signal });
+            result = await response.json().catch(() => ({}));
+        } catch (fetchErr) {
+            clearTimeout(timeoutId);
+            if (useBlockGroups(filters)) {
+                endpoint = 'census-data';
+                response = await fetch(`${API_BASE_URL}/${endpoint}?${params}`);
+                result = await response.json().catch(() => ({}));
+            } else {
+                throw fetchErr;
+            }
+        }
+        clearTimeout(timeoutId);
+
+        // Fallback: if block-groups returns 404 or empty, use census-data (zips)
+        if (useBlockGroups(filters) && (!response.ok || ((result.data || []).length === 0 && (result.total ?? 0) === 0))) {
+            response = await fetch(`${API_BASE_URL}/census-data?${params}`);
+            result = await response.json().catch(() => ({}));
+        }
 
         if (!response.ok) {
             const msg = result.error || response.statusText || 'Request failed';
@@ -74,6 +104,9 @@ async function loadCensusData(filters = {}) {
         updateRecordCount(total, total > MAX_ZIPS_FOR_MAP ? MAX_ZIPS_FOR_MAP : null);
         if (currentData.length === 0 && filters.min_employment_rating != null && !Number.isNaN(Number(filters.min_employment_rating))) {
             console.warn('No zips match filters. Local Employment Rating is only available for NC counties.');
+        }
+        if (currentData.length === 0 && useBlockGroups(filters)) {
+            console.warn('No census block groups found. Run: python scripts/populate_census_block_groups.py');
         }
         updateMap();
 
@@ -159,13 +192,18 @@ async function updateMap() {
     
     currentLayer = activeLayer;
     
-    // Get zip code coordinates (capped to avoid huge Geocoding API usage)
+    const isBlockGroupData = currentData.length > 0 && currentData[0].geoid != null && currentData[0].geometry != null;
     const heatmapData = [];
     const bounds = new google.maps.LatLngBounds();
     const recordsToShow = currentData.slice(0, MAX_ZIPS_FOR_MAP);
     
     for (const record of recordsToShow) {
-        const location = await geocodeZipCode(record.zip_code);
+        let location = null;
+        if (isBlockGroupData && record.geometry) {
+            location = centroidFromGeometry(record.geometry);
+        } else if (record.zip_code) {
+            location = await geocodeZipCode(record.zip_code);
+        }
         if (location) {
             const value = getLayerValue(record, activeLayer);
             if (value !== null && value !== undefined && (activeLayer !== 'employment' || value > 0)) {
@@ -173,15 +211,14 @@ async function updateMap() {
                     location: location,
                     weight: normalizeValue(value, activeLayer)
                 });
-                
                 bounds.extend(location);
-                
-                // Create marker
-                createMarker(location, record, activeLayer);
-                
-                // Create zip code boundary polygon if boundaries are enabled
+                createMarker(location, record, activeLayer, isBlockGroupData);
                 if (showBoundaries) {
-                    await createZipCodeBoundary(record.zip_code, record, activeLayer);
+                    if (isBlockGroupData && record.geometry) {
+                        await createBoundaryFromGeometry(record, activeLayer);
+                    } else {
+                        await createZipCodeBoundary(record.zip_code, record, activeLayer);
+                    }
                 }
             }
         }
@@ -190,13 +227,82 @@ async function updateMap() {
     // Update heatmap if we have data
     if (heatmapData.length > 0) {
         updateHeatmap(heatmapData, activeLayer);
-        // Zoom for non-city views (city zoom is done in searchByCity)
-        if (currentData.length > 1 && !currentFilters.city) {
-            map.fitBounds(bounds);
+        // Zoom to data bounds (including city search - zoom to block groups)
+        if (!bounds.isEmpty()) {
+            map.fitBounds(bounds, { top: 80, right: 80, bottom: 80, left: 80 });
         }
     }
     
     updateLegend();
+}
+
+// Parse geometry - may come as object or JSON string from API
+function parseGeometry(geometry) {
+    if (!geometry) return null;
+    if (typeof geometry === 'string') {
+        try { return JSON.parse(geometry); } catch (_) { return null; }
+    }
+    return geometry;
+}
+
+// Compute centroid from GeoJSON geometry (Polygon or MultiPolygon)
+function centroidFromGeometry(geometry) {
+    const geom = parseGeometry(geometry);
+    if (!geom || !geom.coordinates) return null;
+    let latSum = 0, lngSum = 0, n = 0;
+    function addCoords(coords) {
+        if (Array.isArray(coords[0])) {
+            coords.forEach(addCoords);
+        } else if (coords.length >= 2) {
+            latSum += coords[1];
+            lngSum += coords[0];
+            n++;
+        }
+    }
+    if (geom.type === 'Polygon') {
+        geom.coordinates[0].forEach(addCoords);
+    } else if (geom.type === 'MultiPolygon') {
+        geom.coordinates.forEach(poly => poly[0].forEach(addCoords));
+    }
+    if (n === 0) return null;
+    return new google.maps.LatLng(latSum / n, lngSum / n);
+}
+
+// Create boundary polygon from block group GeoJSON geometry
+async function createBoundaryFromGeometry(record, layer) {
+    const geometry = parseGeometry(record.geometry);
+    if (!geometry) return null;
+    const color = getColorForValue(getLayerValue(record, layer), layer);
+    const processGeometry = (geom) => {
+        if (geom.type === 'Polygon') {
+            return [geom.coordinates[0].map(c => new google.maps.LatLng(c[1], c[0]))];
+        }
+        if (geom.type === 'MultiPolygon') {
+            return geom.coordinates.flatMap(poly => [poly[0].map(c => new google.maps.LatLng(c[1], c[0]))]);
+        }
+        return [];
+    };
+    const paths = processGeometry(geometry);
+    const showBoundaries = document.getElementById('layer-boundaries')?.checked ?? true;
+    if (!showBoundaries) return null;
+    paths.forEach((path, i) => {
+        const polygon = new google.maps.Polygon({
+            paths: path,
+            map: map,
+            strokeColor: '#FF0000',
+            strokeOpacity: 0.9,
+            strokeWeight: 2,
+            fillColor: color,
+            fillOpacity: 0.25,
+            clickable: true,
+            zIndex: 1
+        });
+        polygon.geoid = record.geoid;
+        polygon.record = record;
+        polygon.addListener('click', () => highlightZipCode(polygon, record));
+        zipCodePolygons.push(polygon);
+    });
+    return zipCodePolygons[zipCodePolygons.length - 1];
 }
 
 // Geocode zip code to get coordinates (uses Google Geocoding API; results cached per session).
@@ -343,14 +449,15 @@ function normalizeValue(value, layer) {
 }
 
 // Create marker with info window
-function createMarker(location, record, layer) {
+function createMarker(location, record, layer, isBlockGroup = false) {
     const value = getLayerValue(record, layer);
     const color = getColorForValue(value, layer);
+    const title = isBlockGroup ? `Block Group: ${record.geoid}` : `Zip Code: ${record.zip_code}`;
     
     const marker = new google.maps.Marker({
         position: location,
         map: map,
-        title: `Zip Code: ${record.zip_code}`,
+        title: title,
         icon: {
             path: google.maps.SymbolPath.CIRCLE,
             scale: 8,
@@ -397,9 +504,10 @@ function createInfoWindowContent(record) {
     const ratingsLine = (avgElem !== 'N/A' || avgMid !== 'N/A' || avgHigh !== 'N/A' || blended !== 'N/A')
         ? `<p style="margin: 5px 0;"><strong>Avg Ratings (1-10):</strong> Elem ${avgElem} | Mid ${avgMid} | High ${avgHigh} | Blended ${blended}</p>`
         : '';
+    const geoLabel = record.geoid ? `Block Group: ${record.geoid}` : `Zip Code: ${record.zip_code || 'N/A'}`;
     return `
         <div style="padding: 10px; min-width: 200px;">
-            <h3 style="margin: 0 0 10px 0;">Zip Code: ${record.zip_code || 'N/A'}</h3>
+            <h3 style="margin: 0 0 10px 0;">${geoLabel}</h3>
             <p style="margin: 5px 0;"><strong>Population:</strong> ${formatNumber(record.population)}</p>
             <p style="margin: 5px 0;"><strong>Median Age:</strong> ${record.median_age ? record.median_age.toFixed(1) : 'N/A'}</p>
             <p style="margin: 5px 0;"><strong>Median Household Income (MHI):</strong> ${record.average_household_income ? formatCurrency(record.average_household_income) : 'N/A'}</p>
@@ -846,7 +954,7 @@ function clearPolygons() {
     selectedPolygon = null;
 }
 
-// Clear school district overlay (NCES districts for current zip) and zone labels
+// Clear school district overlay (NCES districts for current zip), perimeter lines, and zone labels
 function clearSchoolDistrictPolygons() {
     schoolDistrictPolygons.forEach(polygon => {
         if (polygon && polygon.setMap) {
@@ -854,18 +962,27 @@ function clearSchoolDistrictPolygons() {
         }
     });
     schoolDistrictPolygons = [];
+    schoolDistrictPolylines.forEach(line => {
+        if (line && line.setMap) line.setMap(null);
+    });
+    schoolDistrictPolylines = [];
     schoolDistrictLabels.forEach(m => {
         if (m && m.setMap) m.setMap(null);
     });
     schoolDistrictLabels = [];
 }
 
-// Compute centroid (bounds center) of a polygon path for label placement
+// Compute label position: centroid (mean of vertices) of polygon path.
+// Placed on largest part per zone. Prefer centroid over bbox center for irregular shapes.
 function pathCentroid(path) {
     if (!path || path.length === 0) return null;
-    const b = new google.maps.LatLngBounds();
-    path.forEach(p => b.extend(p));
-    return b.getCenter();
+    let latSum = 0, lngSum = 0;
+    path.forEach(p => {
+        latSum += p.lat();
+        lngSum += p.lng();
+    });
+    const n = path.length;
+    return new google.maps.LatLng(latSum / n, lngSum / n);
 }
 
 // Turn GeoJSON geometry (Polygon/MultiPolygon, WGS84 [lng,lat]) into Google Maps paths
@@ -943,22 +1060,39 @@ async function loadAndDrawSchoolDistricts(zipCode) {
     clearSchoolDistrictPolygons();
     setSchoolDistrictsStatus('');
     if (!zipCode || !/^\d{5}$/.test(zipCode)) return;
-    setSchoolDistrictsStatus('Loading attendance zones…');
+    setSchoolDistrictsStatus('Loading attendance zones… (may take 1–2 min)');
     try {
-        let response = await fetch(`${API_BASE_URL}/zips/${zipCode}/school-zones?by_level=1`);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 300000);
+        let response = await fetch(`${API_BASE_URL}/zips/${zipCode}/school-zones?by_level=1`, { signal: controller.signal });
+        clearTimeout(timeoutId);
         if (response.status === 404) {
             setSchoolDistrictsStatus('Loading zip boundary…');
             await fetch(`${API_BASE_URL}/zip-boundary/${zipCode}`);
-            response = await fetch(`${API_BASE_URL}/zips/${zipCode}/school-zones?by_level=1`);
+            const c2 = new AbortController();
+            const t2 = setTimeout(() => c2.abort(), 300000);
+            response = await fetch(`${API_BASE_URL}/zips/${zipCode}/school-zones?by_level=1`, { signal: c2.signal });
+            clearTimeout(t2);
         }
         if (!response.ok) {
-            const err = await response.json().catch(() => ({}));
-            const msg = err.message || err.error || response.statusText;
+            let err = {};
+            try {
+                const text = await response.text();
+                err = JSON.parse(text);
+            } catch (_) { /* response may be HTML */ }
+            const msg = err.message || err.error || response.statusText || `HTTP ${response.status}`;
             setSchoolDistrictsStatus(msg.includes('boundary') ? 'Zip boundary needed (search by zip first)' : msg);
             console.warn('School zones not available for zip', zipCode, msg);
             return;
         }
-        const data = await response.json();
+        let data;
+        try {
+            data = await response.json();
+        } catch (parseErr) {
+            setSchoolDistrictsStatus('Invalid response from server');
+            console.warn('School zones: JSON parse failed', parseErr);
+            return;
+        }
         const byLevel = data.by_level && (data.elementary || data.middle || data.high);
         if (!byLevel) {
             const msg = data.message || 'No attendance zones for this zip (NC/SC only)';
@@ -972,10 +1106,21 @@ async function loadAndDrawSchoolDistricts(zipCode) {
         };
         cachedSchoolZonesZip = zipCode;
         const total = (cachedSchoolZonesByLevel.elementary.length + cachedSchoolZonesByLevel.middle.length + cachedSchoolZonesByLevel.high.length);
-        setSchoolDistrictsStatus(`Loaded ${total} attendance zone(s) — each contains multiple schools`);
-        drawSchoolZonesByLevel(cachedSchoolZonesByLevel, zipCode);
+        setSchoolDistrictsStatus(`Loaded ${total} school boundary(ies) — 1 polygon = 1 school (NCES 2015)`);
+        try {
+            drawSchoolZonesByLevel(cachedSchoolZonesByLevel, zipCode);
+        } catch (drawErr) {
+            setSchoolDistrictsStatus('Failed to draw: ' + (drawErr && drawErr.message || String(drawErr)));
+            console.warn('drawSchoolZonesByLevel error:', drawErr);
+        }
     } catch (e) {
-        setSchoolDistrictsStatus('Failed to load zones');
+        let msg = e && (e.message || String(e)) || 'Unknown error';
+        if (e && e.name === 'AbortError') {
+            msg = 'Request timed out (5 min) — try again or use a different zip';
+        } else if (msg.includes('Failed to fetch') || msg.includes('Load failed') || msg.includes('NetworkError')) {
+            msg = 'Server not reachable — is the app running? (python app.py)';
+        }
+        setSchoolDistrictsStatus('Failed to load zones: ' + msg);
         console.warn('Failed to load school zones:', e);
     }
 }
@@ -994,18 +1139,19 @@ function drawSchoolZonesByLevel(byLevel, zipCode) {
     let activeSchoolZoneInfo = null;
     function showZonePopup(zoneData, anchorPosition) {
         if (activeSchoolZoneInfo) activeSchoolZoneInfo.close();
-        const { z, zoneNum, label } = zoneData;
+        const { z, zoneNum, label, hasMultipleParts } = zoneData;
         const district = z.district_name ? `District: ${z.district_name}` : '';
         const blendedLine = z.avg_rating != null
             ? `<br/><strong>Blended average: ${z.avg_rating}/10</strong> <span style="color:#666;font-size:0.9em;">(Great Schools)</span>`
             : '';
+        const multiPartNote = hasMultipleParts ? '<br/><em style="color:#666;font-size:0.9em;">This school\'s boundary has multiple non-contiguous areas in this zip</em>' : '';
         const schools = z.schools || [];
         const schoolsList = schools.length > 0
             ? schools.map(s => `• ${(s.name || 'Unknown')}${s.rating != null ? ` — <strong>${s.rating}/10</strong> Great Schools` : ' — rating N/A'}`).join('<br/>')
             : '<em>No school data for this zone</em>';
         const content = `<div style="padding:12px;min-width:280px;max-width:340px;font-family:sans-serif;">
             <strong style="font-size:1.05em;">Attendance Zone #${zoneNum}</strong> <span style="color:#666;">(${label})</span><br/>
-            ${district}${blendedLine}
+            ${district}${blendedLine}${multiPartNote}
             <br/><br/>
             <strong>Schools in this zone:</strong><br/>
             <div style="margin-top:6px;line-height:1.5;">${schoolsList}</div>
@@ -1019,33 +1165,60 @@ function drawSchoolZonesByLevel(byLevel, zipCode) {
         }, 12000);
     }
 
+    const ZONE_PALETTE = [
+        '#2E7D32', '#1565C0', '#C62828', '#6A1B9A', '#E65100', '#00695C',
+        '#283593', '#558B2F', '#AD1457', '#0277BD', '#EF6C00', '#37474F'
+    ];
     levels.forEach(({ arr, label }) => {
         arr.forEach((z, zoneIdx) => {
             const zoneNum = zoneIdx + 1;
             const geometry = z.geometry;
             if (!geometry) return;
             const paths = geometryToPaths(geometry);
-            const zoneData = { z, zoneNum, label };
-            paths.forEach(path => {
+            const fillColor = ZONE_PALETTE[zoneIdx % ZONE_PALETTE.length];
+            const hasMultipleParts = paths.length > 1;
+            const zoneData = { z, zoneNum, label, hasMultipleParts };
+            let labelPath = null;
+            let maxPathLen = 0;
+            paths.forEach((path, pathIdx) => {
                 if (path.length < 3) return;
                 path.forEach(ll => bounds.extend(ll));
-                const color = z.color || '#666666';
                 const polygon = new google.maps.Polygon({
                     paths: path,
                     map: map,
-                    strokeColor: '#1a1a1a',
+                    strokeColor: '#333333',
                     strokeOpacity: 1,
                     strokeWeight: 3,
-                    fillColor: color,
-                    fillOpacity: 0.18,
+                    fillColor: fillColor,
+                    fillOpacity: 0.25,
                     clickable: true,
-                    zIndex: 3
+                    zIndex: 2
                 });
                 polygon.addListener('click', () => showZonePopup(zoneData, path[0]));
                 schoolDistrictPolygons.push(polygon);
-                const center = pathCentroid(path);
+                const closedPath = path.concat([path[0]]);
+                const perimeterLine = new google.maps.Polyline({
+                    path: closedPath,
+                    map: map,
+                    strokeColor: fillColor,
+                    strokeOpacity: 0.9,
+                    strokeWeight: 2,
+                    clickable: true,
+                    cursor: 'pointer',
+                    zIndex: 5
+                });
+                perimeterLine.addListener('click', () => showZonePopup(zoneData, path[0]));
+                schoolDistrictPolylines.push(perimeterLine);
+                if (path.length > maxPathLen) {
+                    maxPathLen = path.length;
+                    labelPath = path;
+                }
+                drawnCount++;
+            });
+            if (labelPath) {
+                const center = pathCentroid(labelPath);
                 if (center) {
-                    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28"><circle cx="14" cy="14" r="12" fill="white" stroke="#1a1a1a" stroke-width="2"/><text x="14" y="18" text-anchor="middle" font-size="12" font-weight="bold" fill="#1a1a1a">${zoneNum}</text></svg>`;
+                    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28"><circle cx="14" cy="14" r="12" fill="${fillColor}" fill-opacity="0.9" stroke="#1a1a1a" stroke-width="2.5"/><text x="14" y="18" text-anchor="middle" font-size="11" font-weight="bold" fill="#fff">${zoneNum}</text></svg>`;
                     const labelMarker = new google.maps.Marker({
                         position: center,
                         map: map,
@@ -1054,15 +1227,14 @@ function drawSchoolZonesByLevel(byLevel, zipCode) {
                             scaledSize: new google.maps.Size(28, 28),
                             anchor: new google.maps.Point(14, 14)
                         },
-                        zIndex: 4,
+                        zIndex: 7,
                         clickable: true,
                         cursor: 'pointer'
                     });
                     labelMarker.addListener('click', () => showZonePopup(zoneData, center));
                     schoolDistrictLabels.push(labelMarker);
                 }
-                drawnCount++;
-            });
+            }
         });
     });
     if (drawnCount > 0 && !bounds.isEmpty()) {
@@ -1071,7 +1243,7 @@ function drawSchoolZonesByLevel(byLevel, zipCode) {
     if (drawnCount === 0) {
         setSchoolDistrictsStatus('No levels selected — check Elementary, Middle, or High');
     } else {
-        setSchoolDistrictsStatus(`Showing ${drawnCount} attendance zone(s) — numbers mark each boundary`);
+        setSchoolDistrictsStatus(`Showing ${drawnCount} zone(s) — each boundary = one school. Red outer line = zip boundary.`);
     }
     console.log(`Drew ${drawnCount} school zone polygon(s) for zip ${zipCode}`);
 }
@@ -1460,7 +1632,7 @@ async function searchAndZoom() {
         currentLocation = { lat: location.lat(), lng: location.lng() };
         currentZipCode = zipCode;
         
-        // Load ONLY this zip (standalone from city search - no surrounding parcels)
+        // Load block groups at this zip (geocoded point-in-polygon)
         await loadCensusData({ zip_code: zipCode });
         
         // Zoom to the location
@@ -1473,36 +1645,35 @@ async function searchAndZoom() {
             map.setZoom(13);
         }
         
-        // Try to get census data for this zip code
+        const hasBlockGroups = currentData.length > 0 && currentData[0].geoid;
         let record = null;
-        try {
-            const response = await fetch(`${API_BASE_URL}/census-data/zip/${zipCode}`);
-            if (response.ok) {
-                record = await response.json();
-            }
-        } catch (e) {
-            // Data not in database, that's okay
-            console.log('Zip code not in database:', zipCode);
+        if (hasBlockGroups) {
+            currentCensusRecord = currentData[0];
+        } else {
+            try {
+                const response = await fetch(`${API_BASE_URL}/census-data/zip/${zipCode}`);
+                if (response.ok) record = await response.json();
+            } catch (e) { /* zip not in DB */ }
+            currentCensusRecord = record;
         }
-        currentCensusRecord = record;
         updateLegend();
 
-        // Create or highlight the polygon
-        let polygon = zipCodePolygons.find(p => p.zipCode === zipCode);
+        // Create or highlight the polygon (block groups already drawn by updateMap)
+        let polygon = hasBlockGroups
+            ? (zipCodePolygons.find(p => p.geoid === currentData[0].geoid) || zipCodePolygons[0])
+            : zipCodePolygons.find(p => p.zipCode === zipCode);
         
-        if (!polygon) {
-            // Create a new polygon for this zip code
+        if (!polygon && !hasBlockGroups) {
             if (record) {
                 polygon = await createZipCodeBoundary(zipCode, record, currentLayer);
             } else {
-                // Create a temporary polygon even without census data
                 const tempRecord = { zip_code: zipCode, population: 0, average_household_income: 0, median_age: 0 };
                 polygon = await createZipCodeBoundary(zipCode, tempRecord, 'population');
             }
         }
         
         if (polygon) {
-            highlightZipCode(polygon, record);
+            highlightZipCode(polygon, hasBlockGroups ? currentData[0] : record);
         }
         if (document.getElementById('layer-school-districts') && document.getElementById('layer-school-districts').checked) {
             loadAndDrawSchoolDistricts(zipCode);
@@ -1643,8 +1814,8 @@ async function searchByAddress() {
         currentLocation = { lat: location.lat(), lng: location.lng() };
         currentZipCode = zipCode;
         
-        // Load ONLY this zip (standalone from city search - no surrounding parcels)
-        await loadCensusData({ zip_code: zipCode });
+        // Load block groups containing this address (point-in-polygon)
+        await loadCensusData({ lat: location.lat(), lng: location.lng() });
         
         // Zoom to the location
         if (bounds) {
@@ -1656,17 +1827,17 @@ async function searchByAddress() {
             map.setZoom(15);
         }
         
-        // Try to get census data for this zip code
+        const hasBlockGroupsAddr = currentData.length > 0 && currentData[0].geoid;
         let record = null;
-        try {
-            const response = await fetch(`${API_BASE_URL}/census-data/zip/${zipCode}`);
-            if (response.ok) {
-                record = await response.json();
-            }
-        } catch (e) {
-            console.log('Zip code not in database:', zipCode);
+        if (hasBlockGroupsAddr) {
+            currentCensusRecord = currentData[0];
+        } else {
+            try {
+                const response = await fetch(`${API_BASE_URL}/census-data/zip/${zipCode}`);
+                if (response.ok) record = await response.json();
+            } catch (e) { /* zip not in DB */ }
+            currentCensusRecord = record;
         }
-        currentCensusRecord = record;
         updateLegend();
 
         // Ensure boundaries checkbox is checked so boundary is visible
@@ -1675,28 +1846,25 @@ async function searchByAddress() {
             boundariesCheckbox.checked = true;
         }
         
-        // Create or highlight the polygon
-        let polygon = zipCodePolygons.find(p => p.zipCode === zipCode);
+        let polygon = hasBlockGroupsAddr
+            ? (zipCodePolygons.find(p => p.geoid === currentData[0].geoid) || zipCodePolygons[0])
+            : zipCodePolygons.find(p => p.zipCode === zipCode);
         
-        if (!polygon) {
-            // Create a new polygon for this zip code
-            // Use a default layer if currentLayer is not set
+        if (!polygon && !hasBlockGroupsAddr) {
             const layerToUse = currentLayer || (record ? 'population' : 'population');
             if (record) {
                 polygon = await createZipCodeBoundary(zipCode, record, layerToUse);
             } else {
-                // Create a temporary polygon even without census data
                 const tempRecord = { zip_code: zipCode, population: 0, average_household_income: 0, median_age: 0 };
                 polygon = await createZipCodeBoundary(zipCode, tempRecord, 'population');
             }
         }
         
         if (polygon) {
-            // Ensure polygon is visible on map
             if (polygon.setMap && !polygon.getMap()) {
                 polygon.setMap(map);
             }
-            highlightZipCode(polygon, record);
+            highlightZipCode(polygon, hasBlockGroupsAddr ? currentData[0] : record);
         } else {
             // Add a marker at the location
             const marker = new google.maps.Marker({
@@ -1767,28 +1935,31 @@ async function fetchAndDisplaySchoolScores(address, lat, lng) {
             }
         }
         
-        // Display school scores – only show school name when we have a rating (backend only returns name when rating exists)
-        if (schoolData.elementary_school_rating !== null && schoolData.elementary_school_rating !== undefined) {
-            document.getElementById('elementary-score').textContent = schoolData.elementary_school_rating.toFixed(1);
-            document.getElementById('elementary-name').textContent = schoolData.elementary_school_name || '';
-        } else {
-            document.getElementById('elementary-score').textContent = 'N/A';
-            document.getElementById('elementary-name').textContent = 'No data available';
+        // Display school scores – show zoned school names even when rating is N/A
+        const isZoned = schoolData.school_source === 'zoned';
+        const reason = schoolData.fallback_reason || '';
+        const subtitleEl = document.getElementById('school-scores-subtitle');
+        if (subtitleEl) {
+            if (isZoned) {
+                subtitleEl.textContent = 'Address-based attendance zones (NC/SC)';
+            } else if (reason === 'no_zones_loaded') {
+                subtitleEl.textContent = 'Nearest schools — no zone data loaded in database.';
+            } else if (reason === 'point_not_in_any_zone') {
+                subtitleEl.textContent = 'Nearest schools — address outside known zones (try NC/SC, or area may be uncovered).';
+            } else {
+                subtitleEl.textContent = 'Nearest schools (zoned data not available for this area).';
+            }
         }
-        if (schoolData.middle_school_rating !== null && schoolData.middle_school_rating !== undefined) {
-            document.getElementById('middle-score').textContent = schoolData.middle_school_rating.toFixed(1);
-            document.getElementById('middle-name').textContent = schoolData.middle_school_name || '';
-        } else {
-            document.getElementById('middle-score').textContent = 'N/A';
-            document.getElementById('middle-name').textContent = 'No data available';
-        }
-        if (schoolData.high_school_rating !== null && schoolData.high_school_rating !== undefined) {
-            document.getElementById('high-score').textContent = schoolData.high_school_rating.toFixed(1);
-            document.getElementById('high-name').textContent = schoolData.high_school_name || '';
-        } else {
-            document.getElementById('high-score').textContent = 'N/A';
-            document.getElementById('high-name').textContent = 'No data available';
-        }
+        const elemName = schoolData.elementary_school_name || (isZoned ? '' : 'No data available');
+        const midName = schoolData.middle_school_name || (isZoned ? '' : 'No data available');
+        const highName = schoolData.high_school_name || (isZoned ? '' : 'No data available');
+
+        document.getElementById('elementary-score').textContent = (schoolData.elementary_school_rating != null) ? schoolData.elementary_school_rating.toFixed(1) : 'N/A';
+        document.getElementById('elementary-name').textContent = elemName || 'No zoned school';
+        document.getElementById('middle-score').textContent = (schoolData.middle_school_rating != null) ? schoolData.middle_school_rating.toFixed(1) : 'N/A';
+        document.getElementById('middle-name').textContent = midName || 'No zoned school';
+        document.getElementById('high-score').textContent = (schoolData.high_school_rating != null) ? schoolData.high_school_rating.toFixed(1) : 'N/A';
+        document.getElementById('high-name').textContent = highName || 'No zoned school';
         
         if (schoolData.blended_school_score !== null && schoolData.blended_school_score !== undefined) {
             document.getElementById('blended-score').textContent = schoolData.blended_school_score.toFixed(1);

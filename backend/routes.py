@@ -30,6 +30,10 @@ from backend.greatschools_client import GreatSchoolsClient
 
 api = Blueprint('api', __name__, url_prefix='/api')
 
+# Cache for school-zones by_level responses (zip -> response dict). Max 50 zips.
+_school_zones_cache = {}
+_SCHOOL_ZONES_CACHE_MAX = 50
+
 def _census_kwargs(data):
     """Filter dict to only keys that exist on CensusData model (avoids extra columns from API)."""
     allowed = {c.key for c in CensusData.__table__.c}
@@ -141,6 +145,120 @@ def get_census_data():
         })
     except Exception as e:
         return jsonify({"error": str(e), "data": []}), 500
+
+@api.route('/census-block-groups', methods=['GET'])
+def get_census_block_groups():
+    """
+    Get census block group data for map display.
+    Supports: search by city, search by address/zip (lat/lng or zip_code).
+    Returns block groups with geometry (GeoJSON) for drawing boundaries.
+    """
+    try:
+        db: Session = next(get_db())
+    except Exception as e:
+        return jsonify({'error': f'Database connection failed: {str(e)}', 'data': []}), 500
+
+    try:
+        import requests
+        from config.config import Config
+
+        city = request.args.get('city')
+        state = request.args.get('state')
+        lat = request.args.get('lat', type=float)
+        lng = request.args.get('lng', type=float)
+        zip_code = request.args.get('zip_code')
+        min_income = request.args.get('min_income', type=float)
+        min_population = request.args.get('min_population', type=int)
+        min_age = request.args.get('min_age', type=float)
+        limit = request.args.get('limit', type=int, default=5000)
+
+        # Resolve search to (lat, lng) or bbox for spatial query
+        bbox = None  # (lng_min, lat_min, lng_max, lat_max)
+        point = None  # (lng, lat)
+
+        if lat is not None and lng is not None:
+            point = (lng, lat)
+        elif zip_code and str(zip_code).strip():
+            # Geocode zip to point
+            geocode_url = 'https://maps.googleapis.com/maps/api/geocode/json'
+            params = {'address': str(zip_code).strip(), 'key': Config.GOOGLE_MAPS_API_KEY, 'components': 'country:US'}
+            r = requests.get(geocode_url, params=params, timeout=10)
+            data = r.json()
+            if data.get('status') == 'OK' and data.get('results'):
+                loc = data['results'][0]['geometry']['location']
+                point = (loc['lng'], loc['lat'])
+        elif city and str(city).strip():
+            # Geocode city to bbox (use viewport)
+            addr = f"{city.strip()}, {state.strip()}, USA" if state else f"{city.strip()}, USA"
+            geocode_url = 'https://maps.googleapis.com/maps/api/geocode/json'
+            params = {'address': addr, 'key': Config.GOOGLE_MAPS_API_KEY, 'components': 'country:US'}
+            r = requests.get(geocode_url, params=params, timeout=10)
+            data = r.json()
+            if data.get('status') == 'OK' and data.get('results'):
+                vp = data['results'][0].get('geometry', {}).get('viewport', {})
+                ne = vp.get('northeast', {})
+                sw = vp.get('southwest', {})
+                if ne and sw:
+                    bbox = (sw.get('lng'), sw.get('lat'), ne.get('lng'), ne.get('lat'))
+
+        where_parts = ["geometry IS NOT NULL"]
+        params: dict = {}
+        if point:
+            where_parts.append("ST_Contains(geometry, ST_SetSRID(ST_Point(:lng, :lat), 4326))")
+            params["lng"] = point[0]
+            params["lat"] = point[1]
+        elif bbox:
+            where_parts.append("ST_Intersects(geometry, ST_MakeEnvelope(:xmin, :ymin, :xmax, :ymax, 4326))")
+            params["xmin"] = bbox[0]
+            params["ymin"] = bbox[1]
+            params["xmax"] = bbox[2]
+            params["ymax"] = bbox[3]
+        else:
+            # No search: return empty or all (for initial load we could return NC/SC default)
+            return jsonify({"data": [], "total": 0, "limit": limit, "offset": 0})
+
+        if min_income is not None:
+            where_parts.append("average_household_income >= :min_income")
+            params["min_income"] = min_income
+        if min_population is not None:
+            where_parts.append("population >= :min_population")
+            params["min_population"] = min_population
+        if min_age is not None:
+            where_parts.append("median_age >= :min_age")
+            params["min_age"] = min_age
+
+        where_sql = " AND ".join(where_parts)
+        params["lim"] = limit
+
+        # Return geometry as GeoJSON
+        data_sql = text(f"""
+            SELECT id, geoid, state, county, tract, block_group, population, median_age,
+                   average_household_income, total_households, data_year,
+                   ST_AsGeoJSON(geometry)::json AS geometry
+            FROM census_block_groups
+            WHERE {where_sql}
+            ORDER BY population DESC NULLS LAST
+            LIMIT :lim
+        """)
+        rows = db.execute(data_sql, params).fetchall()
+
+        count_sql = text(f"SELECT COUNT(*) FROM census_block_groups WHERE {where_sql}")
+        total = db.execute(count_sql, params).scalar()
+
+        keys = ["id", "geoid", "state", "county", "tract", "block_group", "population", "median_age",
+                "average_household_income", "total_households", "data_year", "geometry"]
+        data = []
+        for row in rows:
+            d = dict(zip(keys, row))
+            d["zip_code"] = None  # Block groups use geoid; frontend expects zip_code or geoid
+            data.append(d)
+
+        return jsonify({"data": data, "total": total, "limit": limit, "offset": 0})
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] census-block-groups: {e}\n{traceback.format_exc()}")
+        return jsonify({"error": str(e), "data": []}), 500
+
 
 @api.route('/census-data/zip/<zip_code>', methods=['GET'])
 def get_census_data_by_zip(zip_code: str):
@@ -1091,7 +1209,7 @@ def export_report():
 
 @api.route('/schools/address', methods=['GET'])
 def get_schools_by_address():
-    """Get school ratings for an address. Uses nearest schools in school_data within ~5 miles (no Apify)."""
+    """Get school ratings for an address. Prefers zoned schools (attendance boundaries) for NC/SC, else nearest schools in school_data."""
     try:
         import requests
         from config.config import Config
@@ -1123,8 +1241,82 @@ def get_schools_by_address():
             lat = location['lat']
             lng = location['lng']
 
-        # Distance-based only: nearest schools in school_data within ~5 miles (no Apify)
+        zip_code = None
+        if address:
+            import re
+            zip_match = re.search(r'\b\d{5}(?:-\d{4})?\b', address)
+            if zip_match:
+                zip_code = zip_match.group(0)
+
         db: Session = next(get_db())
+
+        # STEP 1: Try zoned schools (attendance boundaries) for NC/SC
+        zone_ids_for_zip = None
+        if zip_code:
+            try:
+                rows = db.execute(
+                    text("SELECT zone_id FROM zone_zips WHERE zip_code = :zip"),
+                    {"zip": zip_code}
+                ).fetchall()
+                zone_ids_for_zip = [r[0] for r in rows] if rows else []
+            except Exception:
+                zone_ids_for_zip = None
+
+        if zone_ids_for_zip is not None and len(zone_ids_for_zip) > 0:
+            zones = db.query(AttendanceZone).filter(
+                AttendanceZone.id.in_(zone_ids_for_zip)
+            ).all()
+        else:
+            zones = db.query(AttendanceZone).filter(
+                or_(AttendanceZone.state == 'NC', AttendanceZone.state == 'SC')
+            ).all()
+
+        if zones:
+            zones_list = [z.to_dict() for z in zones]
+            by_level = find_all_zoned_schools(lat, lng, zones_list)
+            elem_zones = by_level.get('elementary', [])
+            mid_zones = by_level.get('middle', [])
+            high_zones = by_level.get('high', [])
+
+            if elem_zones or mid_zones or high_zones:
+                def first_zoned(zone_list, level_key):
+                    if not zone_list:
+                        return None, None, None
+                    z = zone_list[0]
+                    name = z.get('school_name') or 'Unknown'
+                    info = _school_info_for_name_level(db, name, level_key)
+                    rating = float(info['rating']) if info and info.get('rating') is not None else None
+                    addr = (info.get('address') or 'N/A') if info else 'N/A'
+                    return name, rating, addr
+
+                elem_name, elem_rating, elem_addr = first_zoned(elem_zones, 'elementary')
+                mid_name, mid_rating, mid_addr = first_zoned(mid_zones, 'middle')
+                high_name, high_rating, high_addr = first_zoned(high_zones, 'high')
+
+                ratings = [r for r in [elem_rating, mid_rating, high_rating] if r is not None]
+                blended_score = sum(ratings) / len(ratings) if ratings else None
+
+                return jsonify({
+                    'zip_code': zip_code,
+                    'address': address,
+                    'latitude': lat,
+                    'longitude': lng,
+                    'elementary_school_name': elem_name,
+                    'elementary_school_rating': elem_rating,
+                    'elementary_school_address': elem_addr,
+                    'middle_school_name': mid_name,
+                    'middle_school_rating': mid_rating,
+                    'middle_school_address': mid_addr,
+                    'high_school_name': high_name,
+                    'high_school_rating': high_rating,
+                    'high_school_address': high_addr,
+                    'blended_school_score': blended_score,
+                    'school_source': 'zoned',
+                })
+
+        # STEP 2: Fallback to distance-based nearest schools
+        fallback_reason = 'point_not_in_any_zone' if zones else 'no_zones_loaded'
+
         search_radius = 5.0 / 69.0
         query_params = {
             'lat': lat,
@@ -1214,6 +1406,7 @@ def get_schools_by_address():
             'high_school_address': high_addr,
             'blended_school_score': blended_score,
             'school_source': 'distance_fallback',
+            'fallback_reason': fallback_reason,
         }
         return jsonify(result)
         
@@ -1374,7 +1567,6 @@ def get_school_zones_by_zip(zip_code: str):
                 'error': 'Zip boundary not found',
                 'message': f'No boundary for zip {zip_code}. Run: python scripts/download_accurate_boundaries.py --zip-codes {zip_code}'
             }), 404
-
         db: Session = next(get_db())
         zones = db.query(AttendanceZone).filter(
             or_(AttendanceZone.state == 'NC', AttendanceZone.state == 'SC')
@@ -1400,6 +1592,9 @@ def get_school_zones_by_zip(zip_code: str):
 
         by_level = request.args.get('by_level', '').lower() in ('1', 'true', 'yes')
         if by_level:
+            cache_key = zip_code
+            if cache_key in _school_zones_cache:
+                return jsonify(_school_zones_cache[cache_key])
             by_level_out = {'elementary': [], 'middle': [], 'high': []}
             LEVEL_COLORS = {'elementary': '#2E7D32', 'middle': '#1565C0', 'high': '#C62828'}
             def _norm_level(s):
@@ -1409,46 +1604,46 @@ def get_school_zones_by_zip(zip_code: str):
                 if 'high' in s: return 'high'
                 return s
             for level_key in ('elementary', 'middle', 'high'):
-                level_zones = [z for z in intersecting if _norm_level(z.get('school_level')) == level_key]
-                grouped = group_zones_by_district(level_zones)
-                for grp in grouped:
-                    district_zones = grp['zones']
-                    geometry = district_geometry_in_zip(zip_polygon, district_zones)
+                level_zones_raw = [z for z in intersecting if _norm_level(z.get('school_level')) == level_key]
+                seen = set()
+                level_zones = []
+                for z in level_zones_raw:
+                    key = (str(z.get('school_name') or '').strip().lower(), level_key)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    level_zones.append(z)
+                for z in level_zones:
+                    geometry = zone_geometry_in_zip(zip_polygon, z)
                     if geometry is None:
                         continue
-                    schools = []
-                    ratings = []
-                    for z in district_zones:
-                        name = z.get('school_name') or 'Unknown'
-                        rating = None
-                        if z.get('canonical_school_id'):
-                            school = db.query(School).filter(School.id == z['canonical_school_id']).first()
-                            if school:
-                                rating = school.rating
-                        if rating is None:
-                            rating = _rating_for_school(db, name, level_key)
-                        schools.append({
-                            'name': name,
-                            'rating': round(rating, 1) if rating is not None else None,
-                        })
-                        if rating is not None:
-                            ratings.append(rating)
-                    avg_rating = sum(ratings) / len(ratings) if ratings else None
+                    name = z.get('school_name') or 'Unknown'
+                    rating = None
+                    if z.get('canonical_school_id'):
+                        school = db.query(School).filter(School.id == z['canonical_school_id']).first()
+                        if school:
+                            rating = school.rating
+                    if rating is None:
+                        rating = _rating_for_school(db, name, level_key)
                     by_level_out[level_key].append({
-                        'district_id': grp['district_id'],
-                        'district_name': grp['district_name'],
+                        'school_name': name,
+                        'district_name': z.get('school_district'),
                         'geometry': geometry,
-                        'schools': schools,
-                        'avg_rating': round(avg_rating, 1) if avg_rating is not None else None,
+                        'schools': [{'name': name, 'rating': round(rating, 1) if rating is not None else None}],
+                        'avg_rating': round(rating, 1) if rating is not None else None,
                         'color': LEVEL_COLORS.get(level_key, '#666666'),
                     })
-            return jsonify({
+            resp = {
                 'zip_code': zip_code,
                 'by_level': True,
                 'elementary': by_level_out['elementary'],
                 'middle': by_level_out['middle'],
                 'high': by_level_out['high'],
-            })
+            }
+            if len(_school_zones_cache) >= _SCHOOL_ZONES_CACHE_MAX:
+                _school_zones_cache.pop(next(iter(_school_zones_cache)))
+            _school_zones_cache[cache_key] = resp
+            return jsonify(resp)
 
         grouped = group_zones_by_district(intersecting)
         DISTRICT_COLORS = ['#4A90D9', '#50C878', '#E6A23C', '#E07070', '#9B59B6', '#1ABC9C', '#E67E22', '#3498DB']

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from shapely.geometry import Point, shape, mapping
 from shapely.ops import unary_union
+from shapely.strtree import STRtree
 from typing import Optional, Dict, List, Any, Tuple
 
 try:
@@ -236,19 +237,29 @@ def find_zoned_schools(lat: float, lng: float, zones: List[Dict], school_level: 
 
 def find_all_zoned_schools(lat: float, lng: float, zones: List[Dict]) -> Dict[str, List[Dict]]:
     """
-    Find ALL attendance zones (NCES) that contain the given point, grouped by level.
-    Zone boundaries are converted to WGS84 when projected (NCES).
+    Find ALL attendance zones (NCES/Meck) that contain the given point, grouped by level.
+    Uses intersects (more robust than contains) and a tiny buffer for edge cases.
     """
-    print(f"[ZONED SCHOOLS / NCES] find_all_zoned_schools: point ({lat}, {lng}), testing {len(zones)} zones (point-in-polygon)")
+    print(f"[ZONED SCHOOLS] find_all_zoned_schools: point ({lat}, {lng}), testing {len(zones)} zones")
     result = {'elementary': [], 'middle': [], 'high': []}
     point_wgs84 = Point(lng, lat)
+    # ~15m buffer helps with points near zone boundaries (geocoding precision)
+    point_buffered = point_wgs84.buffer(0.00015)
+    def _norm_level(s):
+        s = (s or '').lower().strip()
+        if not s or s == 'other': return None
+        if 'elem' in s or s == 'elementary': return 'elementary'
+        if 'mid' in s or s == 'middle': return 'middle'
+        if 'high' in s: return 'high'
+        return s if s in ('elementary', 'middle', 'high') else None
+
     for zone in zones:
-        level = (zone.get('school_level') or '').lower()
-        if level not in result:
-            result[level] = []
+        level = _norm_level(zone.get('school_level'))
+        if level is None or level not in result:
+            continue
         try:
             polygon = _boundary_to_shapely_wgs84(zone)
-            if polygon is not None and polygon.contains(point_wgs84):
+            if polygon is not None and polygon.intersects(point_buffered):
                 result[level].append(zone)
         except Exception:
             continue
@@ -336,23 +347,48 @@ def zones_intersecting_zip(zip_polygon: Any, zones: List[Dict]) -> List[Dict]:
     return result
 
 
+# Simplify tolerance in degrees (~5m) - speeds up polygon intersection without visible loss
+_SIMPLIFY_TOLERANCE = 0.00005
+
+
 def zones_intersecting_zip_diagnostic(zip_polygon: Any, zones: List[Dict]) -> Tuple[List[Dict], Dict]:
     """
-    Same as zones_intersecting_zip but also returns diagnostic counts:
-    zones_total, zones_with_geometry, intersecting_count.
+    Same as zones_intersecting_zip but also returns diagnostic counts.
+    Uses STRtree spatial index for fast intersection queries (avoids O(n) full scan).
+    Attaches _shapely_geom to each zone to avoid re-parsing in zone_geometry_in_zip.
     """
     zones_with_geom = 0
-    result = []
+    zone_list = []
+    geom_list = []
     for zone in zones:
-        geom = _boundary_to_shapely_wgs84(zone)
+        geom = zone.get('_shapely_geom')
+        if geom is None:
+            geom = _boundary_to_shapely_wgs84(zone)
         if geom is None:
             continue
         zones_with_geom += 1
-        try:
-            if zip_polygon.intersects(geom):
-                result.append(zone)
-        except Exception:
-            continue
+        zone['_shapely_geom'] = geom
+        zone_list.append(zone)
+        geom_list.append(geom)
+    if not geom_list:
+        diag = {"zones_total": len(zones), "zones_with_geometry": 0, "intersecting_count": 0}
+        return [], diag
+    try:
+        tree = STRtree(geom_list)
+        indices = tree.query(zip_polygon, predicate="intersects")
+        if hasattr(indices, 'tolist'):
+            indices = indices.tolist()
+        elif not isinstance(indices, list):
+            indices = list(indices)
+        result = [zone_list[i] for i in indices]
+    except Exception:
+        result = []
+        for zone, geom in zip(zone_list, geom_list):
+            try:
+                if zip_polygon.intersects(geom):
+                    result.append(zone)
+            except Exception:
+                continue
     diag = {"zones_total": len(zones), "zones_with_geometry": zones_with_geom, "intersecting_count": len(result)}
     return result, diag
 
@@ -372,13 +408,20 @@ def group_zones_by_district(zones: List[Dict]) -> List[Dict]:
 
 
 def zone_geometry_in_zip(zip_polygon: Any, zone: Dict) -> Optional[Dict]:
-    """Clip a single zone to the zip polygon. Returns GeoJSON geometry or None."""
-    geom = _boundary_to_shapely_wgs84(zone)
+    """Clip a single zone to the zip polygon. Returns GeoJSON geometry or None.
+    Filters out degenerate (zero-area) results that would render invisibly.
+    Uses zone['_shapely_geom'] if set (from zones_intersecting_zip_diagnostic) to avoid re-parsing.
+    Uses full-precision geometry (no simplify) so adjacent zone boundaries align correctly."""
+    geom = zone.get('_shapely_geom')
+    if geom is None:
+        geom = _boundary_to_shapely_wgs84(zone)
     if geom is None:
         return None
     try:
         inter = zip_polygon.intersection(geom)
         if inter.is_empty:
+            return None
+        if hasattr(inter, 'area') and inter.area < 1e-12:
             return None
         return mapping(inter)
     except Exception:
@@ -392,7 +435,7 @@ def district_geometry_in_zip(zip_polygon: Any, district_zones: List[Dict]) -> Op
     """
     pieces = []
     for z in district_zones:
-        geom = _boundary_to_shapely_wgs84(z)
+        geom = z.get('_shapely_geom') or _boundary_to_shapely_wgs84(z)
         if geom is None:
             continue
         try:
