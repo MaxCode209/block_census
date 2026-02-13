@@ -78,22 +78,11 @@ async function loadCensusData(filters = {}) {
             result = await response.json().catch(() => ({}));
         } catch (fetchErr) {
             clearTimeout(timeoutId);
-            if (useBlockGroups(filters)) {
-                endpoint = 'census-data';
-                response = await fetch(`${API_BASE_URL}/${endpoint}?${params}`);
-                result = await response.json().catch(() => ({}));
-            } else {
-                throw fetchErr;
-            }
+            throw fetchErr;
         }
         clearTimeout(timeoutId);
 
-        // Fallback: if block-groups returns 404 or empty, use census-data (zips)
-        if (useBlockGroups(filters) && (!response.ok || ((result.data || []).length === 0 && (result.total ?? 0) === 0))) {
-            response = await fetch(`${API_BASE_URL}/census-data?${params}`);
-            result = await response.json().catch(() => ({}));
-        }
-
+        // Block group mode: no fallback to census-data (stay with block-level filtering)
         if (!response.ok) {
             const msg = result.error || response.statusText || 'Request failed';
             throw new Error(msg);
@@ -102,9 +91,6 @@ async function loadCensusData(filters = {}) {
         currentData = result.data || [];
         const total = result.total ?? currentData.length;
         updateRecordCount(total, total > MAX_ZIPS_FOR_MAP ? MAX_ZIPS_FOR_MAP : null);
-        if (currentData.length === 0 && filters.min_employment_rating != null && !Number.isNaN(Number(filters.min_employment_rating))) {
-            console.warn('No zips match filters. Local Employment Rating is only available for NC counties.');
-        }
         if (currentData.length === 0 && useBlockGroups(filters)) {
             console.warn('No census block groups found. Run: python scripts/populate_census_block_groups.py');
         }
@@ -118,49 +104,32 @@ async function loadCensusData(filters = {}) {
     }
 }
 
-// Apply data layer filters (population min, MHI min, employment rating min, school scores)
+// Apply data layer filters (block group level: population min, median HHI min)
 function applyDataLayerFilters() {
     const filters = { ...currentFilters };
-    const popVal = document.getElementById('filter-pop-min')?.value?.trim();
-    const mhiVal = document.getElementById('filter-mhi-min')?.value?.trim();
-    const empVal = document.getElementById('filter-emp-min')?.value?.trim();
-    const elemVal = document.getElementById('filter-elem-score-min')?.value?.trim();
-    const blendedVal = document.getElementById('filter-blended-score-min')?.value?.trim();
-    if (popVal) filters.min_population = parseInt(popVal, 10);
-    if (mhiVal) filters.min_income = parseFloat(mhiVal);
-    if (empVal) {
-        const empNum = parseFloat(empVal);
-        if (!Number.isNaN(empNum) && empNum >= 0 && empNum <= 10) {
-            filters.min_employment_rating = empNum;
-        }
-    }
-    if (elemVal) {
-        const n = parseFloat(elemVal);
-        if (!Number.isNaN(n) && n >= 0 && n <= 10) filters.min_elementary_school_rating = n;
-    }
-    if (blendedVal) {
-        const n = parseFloat(blendedVal);
-        if (!Number.isNaN(n) && n >= 0 && n <= 10) filters.min_blended_school_rating = n;
+    const popMin = document.getElementById('filter-pop-min')?.value?.trim();
+    const mhiMin = document.getElementById('filter-mhi-min')?.value?.trim();
+    if (popMin) filters.min_population = parseInt(popMin, 10);
+    if (mhiMin) filters.min_income = parseFloat(mhiMin);
+    if (!filters.city && !filters.zip_code && filters.lat == null && filters.lng == null) {
+        alert('Search a city, zip, or address first, then click Apply Filters.');
+        return;
     }
     loadCensusData(filters);
 }
 
 // Clear data layer filter inputs and reload without them
 function clearDataLayerFilters() {
-    const popEl = document.getElementById('filter-pop-min');
-    const mhiEl = document.getElementById('filter-mhi-min');
-    const empEl = document.getElementById('filter-emp-min');
-    const elemEl = document.getElementById('filter-elem-score-min');
-    const blendedEl = document.getElementById('filter-blended-score-min');
-    if (popEl) popEl.value = '';
-    if (mhiEl) mhiEl.value = '';
-    if (empEl) empEl.value = '';
-    if (elemEl) elemEl.value = '';
-    if (blendedEl) blendedEl.value = '';
+    ['filter-pop-min', 'filter-mhi-min'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+    });
     const filters = {};
     if (currentFilters.city) filters.city = currentFilters.city;
     if (currentFilters.state) filters.state = currentFilters.state;
     if (currentFilters.zip_code) filters.zip_code = currentFilters.zip_code;
+    if (currentFilters.lat != null) filters.lat = currentFilters.lat;
+    if (currentFilters.lng != null) filters.lng = currentFilters.lng;
     loadCensusData(filters);
 }
 
@@ -1259,11 +1228,11 @@ function clearMarkers() {
     }
 }
 
-// Update record count (capMsg: if set, "count (map shows first capMsg)")
+// Update record count - Total Census Blocks matching search & filters (capMsg: if map capped, show "count (map: first N)")
 function updateRecordCount(count, capMsg) {
     const el = document.getElementById('record-count');
     if (!el) return;
-    el.textContent = capMsg != null ? `${count} (map: first ${capMsg})` : count;
+    el.textContent = capMsg != null ? `${count} (map shows first ${capMsg})` : String(count);
 }
 
 // Show/hide loading indicator

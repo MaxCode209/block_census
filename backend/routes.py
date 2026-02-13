@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session, load_only
 from sqlalchemy import or_, text
 from typing import List, Dict, Optional
 from backend.database import get_db
-from backend.models import CensusData, SchoolData, School, AttendanceZone
+from backend.models import CensusData, SchoolData, School, AttendanceZone, CountyEmployer
 
 # Columns that exist in census_data table (no city until added in Supabase)
 _CENSUS_LOAD_COLUMNS = (
@@ -38,6 +38,28 @@ def _census_kwargs(data):
     """Filter dict to only keys that exist on CensusData model (avoids extra columns from API)."""
     allowed = {c.key for c in CensusData.__table__.c}
     return {k: v for k, v in (data or {}).items() if k in allowed}
+
+
+@api.route('/employers', methods=['GET'])
+def get_employers():
+    """Get county employers; optional filter by county. Lightweight endpoint for data validation."""
+    try:
+        db: Session = next(get_db())
+    except Exception as e:
+        return jsonify({'error': f'Database connection failed: {str(e)}', 'data': []}), 500
+    try:
+        county = request.args.get('county', type=str)
+        limit = request.args.get('limit', type=int, default=500)
+        q = db.query(CountyEmployer).order_by(CountyEmployer.county_name, CountyEmployer.rank)
+        if county and county.strip():
+            q = q.filter(CountyEmployer.county_name.ilike(f"%{county.strip()}%"))
+        rows = q.limit(limit).all()
+        return jsonify({'data': [r.to_dict() for r in rows]})
+    except Exception as e:
+        return jsonify({'error': str(e), 'data': []}), 500
+    finally:
+        db.close()
+
 
 @api.route('/census-data', methods=['GET'])
 def get_census_data():
@@ -163,13 +185,16 @@ def get_census_block_groups():
         from config.config import Config
 
         city = request.args.get('city')
-        state = request.args.get('state')
+        state = request.args.get('state')  # Used for geocoding + optional block-level filter
         lat = request.args.get('lat', type=float)
         lng = request.args.get('lng', type=float)
         zip_code = request.args.get('zip_code')
         min_income = request.args.get('min_income', type=float)
+        max_income = request.args.get('max_income', type=float)
         min_population = request.args.get('min_population', type=int)
+        max_population = request.args.get('max_population', type=int)
         min_age = request.args.get('min_age', type=float)
+        max_age = request.args.get('max_age', type=float)
         limit = request.args.get('limit', type=int, default=5000)
 
         # Resolve search to (lat, lng) or bbox for spatial query
@@ -213,19 +238,34 @@ def get_census_block_groups():
             params["ymin"] = bbox[1]
             params["xmax"] = bbox[2]
             params["ymax"] = bbox[3]
+        elif state and str(state).strip():
+            # State-only: filter block groups by state (no city/zip/address)
+            where_parts.append("UPPER(TRIM(state)) = UPPER(TRIM(:state_filter))")
+            params["state_filter"] = str(state).strip()
         else:
-            # No search: return empty or all (for initial load we could return NC/SC default)
             return jsonify({"data": [], "total": 0, "limit": limit, "offset": 0})
 
         if min_income is not None:
             where_parts.append("average_household_income >= :min_income")
             params["min_income"] = min_income
+        if max_income is not None:
+            where_parts.append("average_household_income <= :max_income")
+            params["max_income"] = max_income
         if min_population is not None:
             where_parts.append("population >= :min_population")
             params["min_population"] = min_population
+        if max_population is not None:
+            where_parts.append("population <= :max_population")
+            params["max_population"] = max_population
         if min_age is not None:
             where_parts.append("median_age >= :min_age")
             params["min_age"] = min_age
+        if max_age is not None:
+            where_parts.append("median_age <= :max_age")
+        # Filter block groups by state when provided with bbox/point (state-only adds it above)
+        if (point or bbox) and state and str(state).strip():
+            where_parts.append("UPPER(TRIM(state)) = UPPER(TRIM(:state_filter))")
+            params["state_filter"] = str(state).strip()
 
         where_sql = " AND ".join(where_parts)
         params["lim"] = limit
