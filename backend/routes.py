@@ -1,4 +1,5 @@
 """API routes for the application."""
+import re
 from flask import Blueprint, jsonify, request
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy import or_, text
@@ -195,6 +196,8 @@ def get_census_block_groups():
         max_population = request.args.get('max_population', type=int)
         min_age = request.args.get('min_age', type=float)
         max_age = request.args.get('max_age', type=float)
+        min_zoned_elementary_school_rating = request.args.get('min_zoned_elementary_school_rating', type=float)
+        min_zoned_blended_school_rating = request.args.get('min_zoned_blended_school_rating', type=float)
         limit = request.args.get('limit', type=int, default=5000)
 
         # Resolve search to (lat, lng) or bbox for spatial query
@@ -240,8 +243,11 @@ def get_census_block_groups():
             params["ymax"] = bbox[3]
         elif state and str(state).strip():
             # State-only: filter block groups by state (no city/zip/address)
-            where_parts.append("UPPER(TRIM(state)) = UPPER(TRIM(:state_filter))")
+            # census_block_groups.state uses FIPS codes (37=NC, 45=SC); accept both abbrev and FIPS
+            where_parts.append("(UPPER(TRIM(state)) = UPPER(TRIM(:state_filter)) OR state = :state_fips)")
             params["state_filter"] = str(state).strip()
+            _STATE_FIPS = {"NC": "37", "SC": "45", "VA": "51", "GA": "13", "TN": "47"}
+            params["state_fips"] = _STATE_FIPS.get(str(state).strip().upper(), str(state).strip())
         else:
             return jsonify({"data": [], "total": 0, "limit": limit, "offset": 0})
 
@@ -262,34 +268,76 @@ def get_census_block_groups():
             params["min_age"] = min_age
         if max_age is not None:
             where_parts.append("median_age <= :max_age")
+        if min_zoned_elementary_school_rating is not None:
+            where_parts.append("se.rating IS NOT NULL AND se.rating >= :min_zoned_elementary_school_rating")
+            params["min_zoned_elementary_school_rating"] = min_zoned_elementary_school_rating
+        if min_zoned_blended_school_rating is not None:
+            where_parts.append(
+                "se.rating IS NOT NULL AND sm.rating IS NOT NULL AND sh.rating IS NOT NULL "
+                "AND (se.rating + sm.rating + sh.rating) / 3.0 >= :min_zoned_blended_school_rating"
+            )
+            params["min_zoned_blended_school_rating"] = min_zoned_blended_school_rating
         # Filter block groups by state when provided with bbox/point (state-only adds it above)
+        # census_block_groups.state uses FIPS codes (37=NC, 45=SC); accept both abbrev and FIPS
         if (point or bbox) and state and str(state).strip():
-            where_parts.append("UPPER(TRIM(state)) = UPPER(TRIM(:state_filter))")
+            where_parts.append("(UPPER(TRIM(state)) = UPPER(TRIM(:state_filter)) OR state = :state_fips)")
             params["state_filter"] = str(state).strip()
+            _STATE_FIPS = {"NC": "37", "SC": "45", "VA": "51", "GA": "13", "TN": "47"}
+            params["state_fips"] = _STATE_FIPS.get(str(state).strip().upper(), str(state).strip())
 
         where_sql = " AND ".join(where_parts)
         params["lim"] = limit
+        qualified_where = where_sql
+        for col in ("geometry", "state", "average_household_income", "population", "median_age"):
+            qualified_where = re.sub(rf"\b{col}\b", f"cbg.{col}", qualified_where)
 
-        # Return geometry as GeoJSON
+        # Return geometry as GeoJSON; LEFT JOIN zoned schools and resolve names/ratings
         data_sql = text(f"""
-            SELECT id, geoid, state, county, tract, block_group, population, median_age,
-                   average_household_income, total_households, data_year,
-                   ST_AsGeoJSON(geometry)::json AS geometry
-            FROM census_block_groups
-            WHERE {where_sql}
-            ORDER BY population DESC NULLS LAST
+            SELECT cbg.id, cbg.geoid, cbg.state, cbg.county, cbg.tract, cbg.block_group, cbg.population, cbg.median_age,
+                   cbg.average_household_income, cbg.total_households, cbg.data_year,
+                   ST_AsGeoJSON(cbg.geometry)::json AS geometry,
+                   z.zoned_elementary_school_id, z.zoned_middle_school_id, z.zoned_high_school_id,
+                   se.name AS zoned_elementary_school_name, se.rating AS zoned_elementary_school_rating,
+                   sm.name AS zoned_middle_school_name, sm.rating AS zoned_middle_school_rating,
+                   sh.name AS zoned_high_school_name, sh.rating AS zoned_high_school_rating
+            FROM census_block_groups cbg
+            LEFT JOIN census_block_group_zoned_schools z ON z.geoid = cbg.geoid
+            LEFT JOIN schools se ON se.id = z.zoned_elementary_school_id
+            LEFT JOIN schools sm ON sm.id = z.zoned_middle_school_id
+            LEFT JOIN schools sh ON sh.id = z.zoned_high_school_id
+            WHERE {qualified_where}
+            ORDER BY cbg.population DESC NULLS LAST
             LIMIT :lim
         """)
         rows = db.execute(data_sql, params).fetchall()
 
-        count_sql = text(f"SELECT COUNT(*) FROM census_block_groups WHERE {where_sql}")
+        # Count must use same JOINs when school filters are applied (se/sm/sh come from JOINs)
+        if min_zoned_elementary_school_rating is not None or min_zoned_blended_school_rating is not None:
+            count_sql = text(f"""
+                SELECT COUNT(*) FROM (
+                    SELECT cbg.geoid
+                    FROM census_block_groups cbg
+                    LEFT JOIN census_block_group_zoned_schools z ON z.geoid = cbg.geoid
+                    LEFT JOIN schools se ON se.id = z.zoned_elementary_school_id
+                    LEFT JOIN schools sm ON sm.id = z.zoned_middle_school_id
+                    LEFT JOIN schools sh ON sh.id = z.zoned_high_school_id
+                    WHERE {qualified_where}
+                ) sub
+            """)
+        else:
+            count_sql = text(f"SELECT COUNT(*) FROM census_block_groups WHERE {where_sql}")
         total = db.execute(count_sql, params).scalar()
 
-        keys = ["id", "geoid", "state", "county", "tract", "block_group", "population", "median_age",
-                "average_household_income", "total_households", "data_year", "geometry"]
+        # Use row._mapping for reliable key mapping (zip can misalign if SQL column order changes)
         data = []
         for row in rows:
-            d = dict(zip(keys, row))
+            d = dict(row._mapping) if hasattr(row, "_mapping") else dict(zip(
+                ["id", "geoid", "state", "county", "tract", "block_group", "population", "median_age",
+                 "average_household_income", "total_households", "data_year", "geometry",
+                 "zoned_elementary_school_id", "zoned_middle_school_id", "zoned_high_school_id",
+                 "zoned_elementary_school_name", "zoned_elementary_school_rating",
+                 "zoned_middle_school_name", "zoned_middle_school_rating",
+                 "zoned_high_school_name", "zoned_high_school_rating"], row))
             d["zip_code"] = None  # Block groups use geoid; frontend expects zip_code or geoid
             data.append(d)
 
@@ -298,6 +346,32 @@ def get_census_block_groups():
         import traceback
         print(f"[ERROR] census-block-groups: {e}\n{traceback.format_exc()}")
         return jsonify({"error": str(e), "data": []}), 500
+
+
+@api.route('/debug/zoned-schools', methods=['GET'])
+def debug_zoned_schools():
+    """Diagnostic: verify census_block_group_zoned_schools has data and joins work."""
+    try:
+        db: Session = next(get_db())
+        row = db.execute(text("""
+            SELECT cbg.geoid, z.zoned_elementary_school_id, se.name AS elem_name, se.rating AS elem_rating
+            FROM census_block_groups cbg
+            LEFT JOIN census_block_group_zoned_schools z ON z.geoid = cbg.geoid
+            LEFT JOIN schools se ON se.id = z.zoned_elementary_school_id
+            WHERE z.zoned_elementary_school_id IS NOT NULL
+            LIMIT 1
+        """)).fetchone()
+        if row:
+            return jsonify({
+                "ok": True,
+                "message": "Zoned schools data found",
+                "sample": {"geoid": row[0], "elem_id": row[1], "elem_name": row[2], "elem_rating": float(row[3]) if row[3] else None}
+            })
+        count = db.execute(text("SELECT COUNT(*) FROM census_block_group_zoned_schools")).scalar()
+        return jsonify({"ok": False, "message": "No joined rows; census_block_group_zoned_schools has " + str(count) + " rows"})
+    except Exception as e:
+        import traceback
+        return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 @api.route('/census-data/zip/<zip_code>', methods=['GET'])

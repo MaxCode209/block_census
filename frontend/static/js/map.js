@@ -67,6 +67,8 @@ async function loadCensusData(filters = {}) {
         if (filters.min_employment_rating != null && filters.min_employment_rating !== '' && !Number.isNaN(Number(filters.min_employment_rating))) params.append('min_employment_rating', filters.min_employment_rating);
         if (filters.min_elementary_school_rating != null && filters.min_elementary_school_rating !== '' && !Number.isNaN(Number(filters.min_elementary_school_rating))) params.append('min_elementary_school_rating', filters.min_elementary_school_rating);
         if (filters.min_blended_school_rating != null && filters.min_blended_school_rating !== '' && !Number.isNaN(Number(filters.min_blended_school_rating))) params.append('min_blended_school_rating', filters.min_blended_school_rating);
+        if (filters.min_zoned_elementary_school_rating != null && !Number.isNaN(Number(filters.min_zoned_elementary_school_rating))) params.append('min_zoned_elementary_school_rating', filters.min_zoned_elementary_school_rating);
+        if (filters.min_zoned_blended_school_rating != null && !Number.isNaN(Number(filters.min_zoned_blended_school_rating))) params.append('min_zoned_blended_school_rating', filters.min_zoned_blended_school_rating);
         params.append('limit', '5000');
         
         let endpoint = useBlockGroups(filters) ? 'census-block-groups' : 'census-data';
@@ -109,8 +111,12 @@ function applyDataLayerFilters() {
     const filters = { ...currentFilters };
     const popMin = document.getElementById('filter-pop-min')?.value?.trim();
     const mhiMin = document.getElementById('filter-mhi-min')?.value?.trim();
+    const elemMin = document.getElementById('filter-elementary-min')?.value?.trim();
+    const blendedMin = document.getElementById('filter-blended-min')?.value?.trim();
     if (popMin) filters.min_population = parseInt(popMin, 10);
     if (mhiMin) filters.min_income = parseFloat(mhiMin);
+    if (elemMin) filters.min_zoned_elementary_school_rating = parseFloat(elemMin);
+    if (blendedMin) filters.min_zoned_blended_school_rating = parseFloat(blendedMin);
     if (!filters.city && !filters.zip_code && filters.lat == null && filters.lng == null) {
         alert('Search a city, zip, or address first, then click Apply Filters.');
         return;
@@ -120,7 +126,7 @@ function applyDataLayerFilters() {
 
 // Clear data layer filter inputs and reload without them
 function clearDataLayerFilters() {
-    ['filter-pop-min', 'filter-mhi-min'].forEach(id => {
+    ['filter-pop-min', 'filter-mhi-min', 'filter-elementary-min', 'filter-blended-min'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.value = '';
     });
@@ -458,6 +464,34 @@ function createInfoWindowContent(record) {
             </div>
         `;
     }
+    const geoLabel = record.geoid ? `Block Group: ${record.geoid}` : `Zip Code: ${record.zip_code || 'N/A'}`;
+    const isBlockGroup = !!record.geoid;
+
+    // Block group: always show zoned schools section (with N/A when no data)
+    let zonedSchoolsHtml = '';
+    if (isBlockGroup) {
+        const fmtRating = (v) => (v != null && typeof v === 'number') ? v.toFixed(1) : null;
+        const re = fmtRating(record.zoned_elementary_school_rating);
+        const rm = fmtRating(record.zoned_middle_school_rating);
+        const rh = fmtRating(record.zoned_high_school_rating);
+        const ratings = [re, rm, rh].filter(x => x != null);
+        const blended = ratings.length > 0
+            ? (ratings.reduce((a, b) => a + parseFloat(b), 0) / ratings.length).toFixed(1)
+            : null;
+        const line = (name, rating, label) => {
+            const n = (name || '').trim() || 'N/A';
+            const r = rating != null ? `${rating}/10` : 'N/A';
+            return `<p style="margin: 3px 0 3px 8px; font-size: 0.95em;">${label}: ${n}, ${r}</p>`;
+        };
+        zonedSchoolsHtml = `
+            <p style="margin: 8px 0 4px 0;"><strong>Zoned School Score:</strong> ${blended != null ? blended + '/10' : 'N/A'}</p>
+            ${line(record.zoned_elementary_school_name, re, 'Elementary')}
+            ${line(record.zoned_middle_school_name, rm, 'Middle')}
+            ${line(record.zoned_high_school_name, rh, 'High')}
+        `;
+    }
+
+    // Zip-level census data: schools count and avg ratings
     const tot = record.total_schools != null ? record.total_schools : 'N/A';
     const elem = record.elementary_schools != null ? record.elementary_schools : 'N/A';
     const mid = record.middle_schools != null ? record.middle_schools : 'N/A';
@@ -467,20 +501,21 @@ function createInfoWindowContent(record) {
     const avgMid = fmt(record.average_middle_school_rating);
     const avgHigh = fmt(record.average_high_school_rating);
     const blended = fmt(record.average_school_rating);
-    const schoolLine = (tot !== 'N/A' || elem !== 'N/A' || mid !== 'N/A' || high !== 'N/A')
+    const schoolLine = !isBlockGroup && (tot !== 'N/A' || elem !== 'N/A' || mid !== 'N/A' || high !== 'N/A')
         ? `<p style="margin: 5px 0;"><strong>Schools:</strong> ${tot} total (Elem: ${elem}, Mid: ${mid}, High: ${high})</p>`
         : '';
-    const ratingsLine = (avgElem !== 'N/A' || avgMid !== 'N/A' || avgHigh !== 'N/A' || blended !== 'N/A')
+    const ratingsLine = !isBlockGroup && (avgElem !== 'N/A' || avgMid !== 'N/A' || avgHigh !== 'N/A' || blended !== 'N/A')
         ? `<p style="margin: 5px 0;"><strong>Avg Ratings (1-10):</strong> Elem ${avgElem} | Mid ${avgMid} | High ${avgHigh} | Blended ${blended}</p>`
         : '';
-    const geoLabel = record.geoid ? `Block Group: ${record.geoid}` : `Zip Code: ${record.zip_code || 'N/A'}`;
+
     return `
-        <div style="padding: 10px; min-width: 200px;">
+        <div style="padding: 10px; min-width: 240px;">
             <h3 style="margin: 0 0 10px 0;">${geoLabel}</h3>
             <p style="margin: 5px 0;"><strong>Population:</strong> ${formatNumber(record.population)}</p>
             <p style="margin: 5px 0;"><strong>Median Age:</strong> ${record.median_age ? record.median_age.toFixed(1) : 'N/A'}</p>
             <p style="margin: 5px 0;"><strong>Median Household Income (MHI):</strong> ${record.average_household_income ? formatCurrency(record.average_household_income) : 'N/A'}</p>
             <p style="margin: 5px 0;"><strong>Local Employment Rating:</strong> ${record.local_employment_rating != null ? (record.local_employment_rating + ' / 10') : 'N/A'}</p>
+            ${zonedSchoolsHtml}
             ${schoolLine}
             ${ratingsLine}
         </div>
@@ -908,6 +943,11 @@ function highlightZipCode(shape, record) {
             position: center
         });
         infoWindow.open(map);
+    }
+
+    // Update Zoned Schools panel when clicking a block group
+    if (record && record.geoid) {
+        updateZonedSchoolsPanelFromBlockGroup(record);
     }
 }
 
@@ -1857,8 +1897,12 @@ async function searchByAddress() {
             loadAndDrawSchoolDistricts(zipCode);
         }
         
-        // Fetch school data for this address
-        await fetchAndDisplaySchoolScores(address, location.lat(), location.lng());
+        // Zoned Schools panel: use block group data when available (same as city/state search)
+        if (hasBlockGroupsAddr && currentData[0]) {
+            updateZonedSchoolsPanelFromBlockGroup(currentData[0]);
+        } else {
+            await fetchAndDisplaySchoolScores(address, location.lat(), location.lng());
+        }
         
     } catch (error) {
         console.error('Error searching address:', error);
@@ -1866,6 +1910,28 @@ async function searchByAddress() {
     } finally {
         showLoading(false);
     }
+}
+
+// Update Zoned Schools panel from block group record (zoned school names/ratings from API)
+function updateZonedSchoolsPanelFromBlockGroup(record) {
+    const section = document.getElementById('school-scores-section');
+    const subtitle = document.getElementById('school-scores-subtitle');
+    if (!section || !subtitle) return;
+    section.style.display = 'block';
+    subtitle.textContent = `Block Group ${record.geoid} — Zoned schools (NC/SC)`;
+    const fmt = (v) => (v != null && typeof v === 'number') ? v.toFixed(1) : 'N/A';
+    const re = record.zoned_elementary_school_rating;
+    const rm = record.zoned_middle_school_rating;
+    const rh = record.zoned_high_school_rating;
+    const ratings = [re, rm, rh].filter(x => x != null && typeof x === 'number');
+    const blended = ratings.length > 0 ? (ratings.reduce((a, b) => a + b, 0) / ratings.length).toFixed(1) : 'N/A';
+    document.getElementById('elementary-score').textContent = fmt(re);
+    document.getElementById('elementary-name').textContent = (record.zoned_elementary_school_name || '').trim() || 'N/A';
+    document.getElementById('middle-score').textContent = fmt(rm);
+    document.getElementById('middle-name').textContent = (record.zoned_middle_school_name || '').trim() || 'N/A';
+    document.getElementById('high-score').textContent = fmt(rh);
+    document.getElementById('high-name').textContent = (record.zoned_high_school_name || '').trim() || 'N/A';
+    document.getElementById('blended-score').textContent = blended;
 }
 
 // Fetch and display school scores for an address
