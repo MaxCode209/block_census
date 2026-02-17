@@ -64,11 +64,12 @@ async function loadCensusData(filters = {}) {
         if (filters.max_population) params.append('max_population', filters.max_population);
         if (filters.min_age != null && filters.min_age !== '') params.append('min_age', filters.min_age);
         if (filters.max_age != null && filters.max_age !== '') params.append('max_age', filters.max_age);
-        if (filters.min_employment_rating != null && filters.min_employment_rating !== '' && !Number.isNaN(Number(filters.min_employment_rating))) params.append('min_employment_rating', filters.min_employment_rating);
         if (filters.min_elementary_school_rating != null && filters.min_elementary_school_rating !== '' && !Number.isNaN(Number(filters.min_elementary_school_rating))) params.append('min_elementary_school_rating', filters.min_elementary_school_rating);
         if (filters.min_blended_school_rating != null && filters.min_blended_school_rating !== '' && !Number.isNaN(Number(filters.min_blended_school_rating))) params.append('min_blended_school_rating', filters.min_blended_school_rating);
         if (filters.min_zoned_elementary_school_rating != null && !Number.isNaN(Number(filters.min_zoned_elementary_school_rating))) params.append('min_zoned_elementary_school_rating', filters.min_zoned_elementary_school_rating);
         if (filters.min_zoned_blended_school_rating != null && !Number.isNaN(Number(filters.min_zoned_blended_school_rating))) params.append('min_zoned_blended_school_rating', filters.min_zoned_blended_school_rating);
+        if (filters.min_local_employment_score != null && !Number.isNaN(Number(filters.min_local_employment_score))) params.append('min_local_employment_score', filters.min_local_employment_score);
+        if (filters.min_employment_access_score != null && !Number.isNaN(Number(filters.min_employment_access_score))) params.append('min_employment_access_score', filters.min_employment_access_score);
         params.append('limit', '5000');
         
         let endpoint = useBlockGroups(filters) ? 'census-block-groups' : 'census-data';
@@ -113,10 +114,14 @@ function applyDataLayerFilters() {
     const mhiMin = document.getElementById('filter-mhi-min')?.value?.trim();
     const elemMin = document.getElementById('filter-elementary-min')?.value?.trim();
     const blendedMin = document.getElementById('filter-blended-min')?.value?.trim();
+    const lesMin = document.getElementById('filter-les-min')?.value?.trim();
+    const easMin = document.getElementById('filter-eas-min')?.value?.trim();
     if (popMin) filters.min_population = parseInt(popMin, 10);
     if (mhiMin) filters.min_income = parseFloat(mhiMin);
     if (elemMin) filters.min_zoned_elementary_school_rating = parseFloat(elemMin);
     if (blendedMin) filters.min_zoned_blended_school_rating = parseFloat(blendedMin);
+    if (lesMin) filters.min_local_employment_score = parseFloat(lesMin);
+    if (easMin) filters.min_employment_access_score = parseFloat(easMin);
     if (!filters.city && !filters.zip_code && filters.lat == null && filters.lng == null) {
         alert('Search a city, zip, or address first, then click Apply Filters.');
         return;
@@ -126,7 +131,7 @@ function applyDataLayerFilters() {
 
 // Clear data layer filter inputs and reload without them
 function clearDataLayerFilters() {
-    ['filter-pop-min', 'filter-mhi-min', 'filter-elementary-min', 'filter-blended-min'].forEach(id => {
+    ['filter-pop-min', 'filter-mhi-min', 'filter-elementary-min', 'filter-blended-min', 'filter-les-min', 'filter-eas-min'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.value = '';
     });
@@ -398,7 +403,7 @@ function getLayerValue(record, layer) {
         case 'age':
             return record.median_age;
         case 'employment':
-            return record.local_employment_rating;
+            return record.local_employment_score != null ? record.local_employment_score : null;
         default:
             return null;
     }
@@ -508,13 +513,26 @@ function createInfoWindowContent(record) {
         ? `<p style="margin: 5px 0;"><strong>Avg Ratings (1-10):</strong> Elem ${avgElem} | Mid ${avgMid} | High ${avgHigh} | Blended ${blended}</p>`
         : '';
 
+    // Debug: log employment scores to console
+    if (record.geoid && (record.local_employment_score != null || record.employment_access_score != null)) {
+        console.log(`Block ${record.geoid}: LES=${record.local_employment_score} (type: ${typeof record.local_employment_score}), EAS=${record.employment_access_score} (type: ${typeof record.employment_access_score})`);
+    }
+    
+    const lesValue = (record.local_employment_score != null && record.local_employment_score !== undefined && record.local_employment_score !== '') 
+        ? Number(record.local_employment_score).toFixed(2) + ' / 10' 
+        : 'N/A';
+    const easValue = (record.employment_access_score != null && record.employment_access_score !== undefined && record.employment_access_score !== '') 
+        ? Number(record.employment_access_score).toFixed(2) + ' / 10' 
+        : 'N/A';
+    
     return `
         <div style="padding: 10px; min-width: 240px;">
             <h3 style="margin: 0 0 10px 0;">${geoLabel}</h3>
             <p style="margin: 5px 0;"><strong>Population:</strong> ${formatNumber(record.population)}</p>
             <p style="margin: 5px 0;"><strong>Median Age:</strong> ${record.median_age ? record.median_age.toFixed(1) : 'N/A'}</p>
             <p style="margin: 5px 0;"><strong>Median Household Income (MHI):</strong> ${record.average_household_income ? formatCurrency(record.average_household_income) : 'N/A'}</p>
-            <p style="margin: 5px 0;"><strong>Local Employment Rating:</strong> ${record.local_employment_rating != null ? (record.local_employment_rating + ' / 10') : 'N/A'}</p>
+            <p style="margin: 5px 0;"><strong>Local Employment Score (LES):</strong> ${lesValue}</p>
+            <p style="margin: 5px 0;"><strong>Employment Access Score (EAS):</strong> ${easValue}</p>
             ${zonedSchoolsHtml}
             ${schoolLine}
             ${ratingsLine}
@@ -593,7 +611,7 @@ function updateLegend() {
     const pop = r.population != null ? formatNumber(r.population) : 'N/A';
     const age = r.median_age != null ? r.median_age.toFixed(1) + ' years' : 'N/A';
     const hhi = r.average_household_income != null ? formatCurrency(r.average_household_income) : 'N/A';
-    const empRating = r.local_employment_rating != null ? (r.local_employment_rating + ' / 10') : 'N/A';
+    const empScore = r.local_employment_score != null ? (r.local_employment_score.toFixed(2) + ' / 10') : 'N/A';
 
     legend.innerHTML = `
         <h4>Demographics</h4>
@@ -601,7 +619,7 @@ function updateLegend() {
         <p class="legend-row"><strong>Population:</strong> ${pop}</p>
         <p class="legend-row"><strong>Median Age:</strong> ${age}</p>
         <p class="legend-row"><strong>Median HHI:</strong> ${hhi}</p>
-        <p class="legend-row"><strong>Local Employment Rating:</strong> ${empRating}</p>
+        <p class="legend-row"><strong>Local Employment Score (LES):</strong> ${empScore}</p>
     `;
 }
 

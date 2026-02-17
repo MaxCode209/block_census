@@ -198,6 +198,8 @@ def get_census_block_groups():
         max_age = request.args.get('max_age', type=float)
         min_zoned_elementary_school_rating = request.args.get('min_zoned_elementary_school_rating', type=float)
         min_zoned_blended_school_rating = request.args.get('min_zoned_blended_school_rating', type=float)
+        min_local_employment_score = request.args.get('min_local_employment_score', type=float)
+        min_employment_access_score = request.args.get('min_employment_access_score', type=float)
         limit = request.args.get('limit', type=int, default=5000)
 
         # Resolve search to (lat, lng) or bbox for spatial query
@@ -277,6 +279,12 @@ def get_census_block_groups():
                 "AND (se.rating + sm.rating + sh.rating) / 3.0 >= :min_zoned_blended_school_rating"
             )
             params["min_zoned_blended_school_rating"] = min_zoned_blended_school_rating
+        if min_local_employment_score is not None:
+            where_parts.append("cbg.local_employment_score IS NOT NULL AND cbg.local_employment_score >= :min_local_employment_score")
+            params["min_local_employment_score"] = min_local_employment_score
+        if min_employment_access_score is not None:
+            where_parts.append("cbg.employment_access_score IS NOT NULL AND cbg.employment_access_score >= :min_employment_access_score")
+            params["min_employment_access_score"] = min_employment_access_score
         # Filter block groups by state when provided with bbox/point (state-only adds it above)
         # census_block_groups.state uses FIPS codes (37=NC, 45=SC); accept both abbrev and FIPS
         if (point or bbox) and state and str(state).strip():
@@ -290,11 +298,14 @@ def get_census_block_groups():
         qualified_where = where_sql
         for col in ("geometry", "state", "average_household_income", "population", "median_age"):
             qualified_where = re.sub(rf"\b{col}\b", f"cbg.{col}", qualified_where)
+        # Employment score filters are already qualified with cbg., so ensure they're in qualified_where
+        # (They're already there since they're in where_parts, but make sure)
 
         # Return geometry as GeoJSON; LEFT JOIN zoned schools and resolve names/ratings
         data_sql = text(f"""
             SELECT cbg.id, cbg.geoid, cbg.state, cbg.county, cbg.tract, cbg.block_group, cbg.population, cbg.median_age,
                    cbg.average_household_income, cbg.total_households, cbg.data_year,
+                   cbg.local_employment_score, cbg.employment_access_score,
                    ST_AsGeoJSON(cbg.geometry)::json AS geometry,
                    z.zoned_elementary_school_id, z.zoned_middle_school_id, z.zoned_high_school_id,
                    se.name AS zoned_elementary_school_name, se.rating AS zoned_elementary_school_rating,
@@ -312,7 +323,10 @@ def get_census_block_groups():
         rows = db.execute(data_sql, params).fetchall()
 
         # Count must use same JOINs when school filters are applied (se/sm/sh come from JOINs)
+        # Use qualified_where when employment score filters are applied (they reference cbg.*)
+        # Always use qualified_where when it differs from where_sql (has cbg. prefixes)
         if min_zoned_elementary_school_rating is not None or min_zoned_blended_school_rating is not None:
+            # School filters require JOINs
             count_sql = text(f"""
                 SELECT COUNT(*) FROM (
                     SELECT cbg.geoid
@@ -325,20 +339,90 @@ def get_census_block_groups():
                 ) sub
             """)
         else:
-            count_sql = text(f"SELECT COUNT(*) FROM census_block_groups WHERE {where_sql}")
+            # For employment filters or when qualified_where has cbg. prefixes, use qualified_where with cbg alias
+            # This ensures employment filters (which use cbg.*) and state filters (qualified to cbg.state) work correctly
+            count_sql = text(f"SELECT COUNT(*) FROM census_block_groups cbg WHERE {qualified_where}")
         total = db.execute(count_sql, params).scalar()
 
         # Use row._mapping for reliable key mapping (zip can misalign if SQL column order changes)
         data = []
         for row in rows:
-            d = dict(row._mapping) if hasattr(row, "_mapping") else dict(zip(
-                ["id", "geoid", "state", "county", "tract", "block_group", "population", "median_age",
-                 "average_household_income", "total_households", "data_year", "geometry",
-                 "zoned_elementary_school_id", "zoned_middle_school_id", "zoned_high_school_id",
-                 "zoned_elementary_school_name", "zoned_elementary_school_rating",
-                 "zoned_middle_school_name", "zoned_middle_school_rating",
-                 "zoned_high_school_name", "zoned_high_school_rating"], row))
+            if hasattr(row, "_mapping"):
+                d = dict(row._mapping)
+                # Debug: log first row to see what keys are present
+                if len(data) == 0:
+                    print(f"[DEBUG] First row keys: {list(d.keys())}")
+                    print(f"[DEBUG] LES value: {d.get('local_employment_score')} (type: {type(d.get('local_employment_score'))})")
+                    print(f"[DEBUG] EAS value: {d.get('employment_access_score')} (type: {type(d.get('employment_access_score'))})")
+                    # Check for alternative key names
+                    for key in d.keys():
+                        if 'employment' in key.lower() or 'score' in key.lower():
+                            print(f"[DEBUG] Found key with 'employment' or 'score': {key} = {d[key]}")
+            else:
+                d = dict(zip(
+                    ["id", "geoid", "state", "county", "tract", "block_group", "population", "median_age",
+                     "average_household_income", "total_households", "data_year", 
+                     "local_employment_score", "employment_access_score", "geometry",
+                     "zoned_elementary_school_id", "zoned_middle_school_id", "zoned_high_school_id",
+                     "zoned_elementary_school_name", "zoned_elementary_school_rating",
+                     "zoned_middle_school_name", "zoned_middle_school_rating",
+                     "zoned_high_school_name", "zoned_high_school_rating"], row))
             d["zip_code"] = None  # Block groups use geoid; frontend expects zip_code or geoid
+            
+            # Ensure scores are always present (even if None) - handle case where keys might be missing
+            if "local_employment_score" not in d:
+                d["local_employment_score"] = None
+            if "employment_access_score" not in d:
+                d["employment_access_score"] = None
+            # Convert numeric scores to float for JSON serialization (handle Decimal, str, None)
+            # PostgreSQL NUMERIC returns as Decimal, which needs explicit conversion
+            from decimal import Decimal
+            
+            # Debug first row
+            if len(data) == 0:
+                print(f"[DEBUG] Before conversion - LES: {d.get('local_employment_score')} (type: {type(d.get('local_employment_score'))})")
+                print(f"[DEBUG] Before conversion - EAS: {d.get('employment_access_score')} (type: {type(d.get('employment_access_score'))})")
+            
+            # Convert LES
+            les_val = d.get("local_employment_score")
+            if les_val is not None:
+                try:
+                    if isinstance(les_val, Decimal):
+                        d["local_employment_score"] = float(les_val)
+                    elif isinstance(les_val, (int, float)):
+                        d["local_employment_score"] = float(les_val)
+                    elif isinstance(les_val, str) and les_val.strip():
+                        d["local_employment_score"] = float(les_val)
+                    else:
+                        d["local_employment_score"] = None
+                except (ValueError, TypeError) as e:
+                    print(f"[DEBUG] LES conversion error: {e}, value: {les_val}, type: {type(les_val)}")
+                    d["local_employment_score"] = None
+            else:
+                d["local_employment_score"] = None
+                
+            # Convert EAS
+            eas_val = d.get("employment_access_score")
+            if eas_val is not None:
+                try:
+                    if isinstance(eas_val, Decimal):
+                        d["employment_access_score"] = float(eas_val)
+                    elif isinstance(eas_val, (int, float)):
+                        d["employment_access_score"] = float(eas_val)
+                    elif isinstance(eas_val, str) and eas_val.strip():
+                        d["employment_access_score"] = float(eas_val)
+                    else:
+                        d["employment_access_score"] = None
+                except (ValueError, TypeError) as e:
+                    print(f"[DEBUG] EAS conversion error: {e}, value: {eas_val}, type: {type(eas_val)}")
+                    d["employment_access_score"] = None
+            else:
+                d["employment_access_score"] = None
+                
+            if len(data) == 0:
+                print(f"[DEBUG] After conversion - LES: {d.get('local_employment_score')} (type: {type(d.get('local_employment_score'))})")
+                print(f"[DEBUG] After conversion - EAS: {d.get('employment_access_score')} (type: {type(d.get('employment_access_score'))})")
+                
             data.append(d)
 
         return jsonify({"data": data, "total": total, "limit": limit, "offset": 0})
