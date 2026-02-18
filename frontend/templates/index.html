@@ -134,6 +134,8 @@
                 
                 <div class="actions-section">
                     <h3>Actions</h3>
+                    <button id="export-landvision" class="btn btn-primary" title="Download current block groups as a shapefile ZIP to add as a layer in LandVision">Export for LandVision</button>
+                    <p class="search-hint" style="margin: 4px 0 0 0; font-size: 0.8em;">Search &amp; filter first, then export. Add the ZIP as a layer in LandVision to view parcels.</p>
                     <button id="fetch-data" class="btn btn-primary">Fetch Census Data</button>
                     <button id="export-sheets" class="btn btn-success">Download Report (Word/PDF)</button>
                     <button id="refresh-map" class="btn btn-secondary">Refresh Map</button>
@@ -169,6 +171,7 @@
         </div>
     </div>
     
+    <script>window.APP_ORIGIN = "{{ export_base_url }}";</script>
     <script src="{{ url_for('static', filename='js/map.js') }}"></script>
 </body>
 </html>

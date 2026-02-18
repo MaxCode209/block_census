@@ -1454,6 +1454,65 @@ function doInit() {
             showLoading(false);
         }
     });
+
+    // Export for LandVision: download current block groups as shapefile ZIP (census block number, location, borders)
+    document.getElementById('export-landvision').addEventListener('click', async () => {
+        const f = currentFilters || {};
+        const hasGeo = !!(f.city || f.zip_code || (f.lat != null && f.lng != null));
+        if (!hasGeo) {
+            alert('Search by city, zip, or address first. Then apply any filters and click "Export for LandVision".');
+            return;
+        }
+        const params = new URLSearchParams();
+        params.append('format', 'shapefile');
+        if (f.zip_code) params.append('zip_code', f.zip_code);
+        if (f.city) params.append('city', f.city);
+        if (f.state) params.append('state', f.state);
+        if (f.lat != null) params.append('lat', f.lat);
+        if (f.lng != null) params.append('lng', f.lng);
+        if (f.min_income) params.append('min_income', f.min_income);
+        if (f.max_income) params.append('max_income', f.max_income);
+        if (f.min_population) params.append('min_population', f.min_population);
+        if (f.max_population) params.append('max_population', f.max_population);
+        if (f.min_age != null && f.min_age !== '') params.append('min_age', f.min_age);
+        if (f.max_age != null && f.max_age !== '') params.append('max_age', f.max_age);
+        if (f.min_zoned_elementary_school_rating != null && !Number.isNaN(Number(f.min_zoned_elementary_school_rating))) params.append('min_zoned_elementary_school_rating', f.min_zoned_elementary_school_rating);
+        if (f.min_zoned_blended_school_rating != null && !Number.isNaN(Number(f.min_zoned_blended_school_rating))) params.append('min_zoned_blended_school_rating', f.min_zoned_blended_school_rating);
+        if (f.min_local_employment_score != null && !Number.isNaN(Number(f.min_local_employment_score))) params.append('min_local_employment_score', f.min_local_employment_score);
+        if (f.min_employment_access_score != null && !Number.isNaN(Number(f.min_employment_access_score))) params.append('min_employment_access_score', f.min_employment_access_score);
+        params.append('limit', '10000');
+        const base = window.location.origin;
+        const exportPath = '/api/census-block-groups';
+        const url = `${base}${exportPath}?${params.toString()}`;
+        console.log('[Export] Requesting:', url);
+        try {
+            const response = await fetch(url, { method: 'GET' });
+            if (!response.ok) {
+                const text = await response.text();
+                let msg = `Server returned ${response.status} (${response.statusText}).`;
+                try {
+                    const j = JSON.parse(text);
+                    if (j.error) msg += ' ' + j.error;
+                } catch (_) { if (text) msg += ' ' + text.slice(0, 200); }
+                msg += '\n\nTrying direct download - check address bar for requested URL.';
+                alert('Export failed: ' + msg);
+                window.open(url, '_blank');
+                return;
+            }
+            const blob = await response.blob();
+            const disp = response.headers.get('Content-Disposition');
+            const m = disp && disp.match(/filename="?([^";\n]+)"?/);
+            const filename = m ? m[1] : `block_groups_landvision_${new Date().toISOString().slice(0,10)}.zip`;
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = filename;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        } catch (err) {
+            alert('Export failed: ' + (err.message || err) + '\n\nOpening URL in new tab so you can see the exact address.');
+            window.open(url, '_blank');
+        }
+    });
     
     // Refresh map
     document.getElementById('refresh-map').addEventListener('click', () => {

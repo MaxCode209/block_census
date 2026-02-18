@@ -1,9 +1,14 @@
 """API routes for the application."""
+import io
 import re
-from flask import Blueprint, jsonify, request
+import zipfile
+from decimal import Decimal
+
+from flask import Blueprint, jsonify, request, send_file
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy import or_, text
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple, Any
+
 from backend.database import get_db
 from backend.models import CensusData, SchoolData, School, AttendanceZone, CountyEmployer
 
@@ -175,7 +180,21 @@ def get_census_block_groups():
     Get census block group data for map display.
     Supports: search by city, search by address/zip (lat/lng or zip_code).
     Returns block groups with geometry (GeoJSON) for drawing boundaries.
+    If format=shapefile, returns LandVision-ready ZIP instead (same endpoint, so no 404).
+    If format=test-zip, returns a minimal valid ZIP to verify downloads work.
     """
+    if request.args.get('format') == 'test-zip':
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_STORED) as zf:
+            zf.writestr('hello.txt', b'LandVision export test - if you see this, download is OK')
+        zip_bytes = zip_buf.getvalue()
+        from flask import Response
+        r = Response(zip_bytes, mimetype='application/zip')
+        r.headers['Content-Disposition'] = 'attachment; filename="test_download.zip"'
+        r.headers['Content-Length'] = len(zip_bytes)
+        return r
+    if request.args.get('format') == 'shapefile':
+        return export_census_block_groups()
     try:
         db: Session = next(get_db())
     except Exception as e:
@@ -430,6 +449,423 @@ def get_census_block_groups():
         import traceback
         print(f"[ERROR] census-block-groups: {e}\n{traceback.format_exc()}")
         return jsonify({"error": str(e), "data": []}), 500
+
+
+def _geojson_geom_to_shapefile_parts(geom: Dict[str, Any], max_vertices: int = 10000) -> List[List[Tuple[float, float]]]:
+    """Convert GeoJSON geometry (Polygon or MultiPolygon) to list of rings for pyshp.
+    Each ring is [(lng, lat), ...]. Simplifies if vertex count exceeds max_vertices (LandVision limit)."""
+    try:
+        from shapely.geometry import shape
+        shp = shape(geom)
+        if shp.is_empty:
+            return []
+        polys = list(shp.geoms) if hasattr(shp, 'geoms') else [shp]
+        n = sum(len(list(p.exterior.coords)) for p in polys)
+        if n > max_vertices and hasattr(shp, 'simplify'):
+            shp = shp.simplify(0.00005, preserve_topology=True)
+            polys = list(shp.geoms) if hasattr(shp, 'geoms') else [shp]
+        parts = []
+        for poly in polys:
+            ext = list(poly.exterior.coords)
+            if len(ext) < 3:
+                continue
+            if ext[0] != ext[-1]:
+                ext.append(ext[0])
+            parts.append([(float(x), float(y)) for x, y in ext])
+        return parts
+    except Exception:
+        return []
+
+
+@api.route('/export/test', methods=['GET'])
+def export_test():
+    """Simple test route to verify export endpoints are registered."""
+    return jsonify({"ok": True, "message": "Export routes are working", "path": "/api/export/test"})
+
+
+@api.route('/test-zip-download', methods=['GET'])
+def api_test_zip_download():
+    """Return a minimal valid ZIP. Use: http://127.0.0.1:5001/api/test-zip-download"""
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_STORED) as zf:
+        zf.writestr('hello.txt', b'LandVision export test - if you see this, download is OK')
+    zip_bytes = zip_buf.getvalue()
+    from flask import Response
+    r = Response(zip_bytes, mimetype='application/zip')
+    r.headers['Content-Disposition'] = 'attachment; filename="test_download.zip"'
+    r.headers['Content-Length'] = len(zip_bytes)
+    return r
+
+
+@api.route('/export/test-zip', methods=['GET'])
+def export_test_zip():
+    """Return a minimal valid ZIP so you can verify downloads are not corrupted."""
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_STORED) as zf:
+        zf.writestr('hello.txt', b'LandVision export test - if you see this, download is OK')
+    zip_bytes = zip_buf.getvalue()
+    from flask import Response
+    r = Response(zip_bytes, mimetype='application/zip')
+    r.headers['Content-Disposition'] = 'attachment; filename="test_download.zip"'
+    r.headers['Content-Length'] = len(zip_bytes)
+    return r
+
+@api.route('/census-block-groups/export', methods=['GET'])
+@api.route('/export/landvision', methods=['GET'])
+def export_census_block_groups():
+    """
+    Export current census block groups (same filters as map) for use in LandVision or other GIS.
+    - format=geojson: GeoJSON FeatureCollection (same params as GET census-block-groups).
+    - format=shapefile: ZIP containing .shp, .shx, .dbf, .prj (LandVision-ready: no nested folder, WGS84, max 30MB).
+    """
+    try:
+        fmt = (request.args.get('format') or 'shapefile').strip().lower()
+        if fmt not in ('geojson', 'shapefile'):
+            return jsonify({"error": "format must be geojson or shapefile"}), 400
+
+        # Call get_census_block_groups directly - it returns a Flask Response, so we need to extract JSON
+        try:
+            db: Session = next(get_db())
+        except Exception as e:
+            return jsonify({'error': f'Database connection failed: {str(e)}'}), 500
+
+        try:
+            import requests
+            from config.config import Config
+
+            # Build same query as get_census_block_groups
+            city = request.args.get('city')
+            state = request.args.get('state')
+            lat = request.args.get('lat', type=float)
+            lng = request.args.get('lng', type=float)
+            zip_code = request.args.get('zip_code')
+            min_income = request.args.get('min_income', type=float)
+            max_income = request.args.get('max_income', type=float)
+            min_population = request.args.get('min_population', type=int)
+            max_population = request.args.get('max_population', type=int)
+            min_age = request.args.get('min_age', type=float)
+            max_age = request.args.get('max_age', type=float)
+            min_zoned_elementary_school_rating = request.args.get('min_zoned_elementary_school_rating', type=float)
+            min_zoned_blended_school_rating = request.args.get('min_zoned_blended_school_rating', type=float)
+            min_local_employment_score = request.args.get('min_local_employment_score', type=float)
+            min_employment_access_score = request.args.get('min_employment_access_score', type=float)
+            limit = request.args.get('limit', type=int, default=10000)
+
+            # Reuse the exact same logic from get_census_block_groups (geocoding, where building, query)
+            bbox = None
+            point = None
+
+            if lat is not None and lng is not None:
+                point = (lng, lat)
+            elif zip_code and str(zip_code).strip():
+                geocode_url = 'https://maps.googleapis.com/maps/api/geocode/json'
+                params_geo = {'address': str(zip_code).strip(), 'key': Config.GOOGLE_MAPS_API_KEY, 'components': 'country:US'}
+                r = requests.get(geocode_url, params=params_geo, timeout=10)
+                data_geo = r.json()
+                if data_geo.get('status') == 'OK' and data_geo.get('results'):
+                    loc = data_geo['results'][0]['geometry']['location']
+                    point = (loc['lng'], loc['lat'])
+            elif city and str(city).strip():
+                addr = f"{city.strip()}, {state.strip()}, USA" if state else f"{city.strip()}, USA"
+                geocode_url = 'https://maps.googleapis.com/maps/api/geocode/json'
+                params_geo = {'address': addr, 'key': Config.GOOGLE_MAPS_API_KEY, 'components': 'country:US'}
+                r = requests.get(geocode_url, params=params_geo, timeout=10)
+                data_geo = r.json()
+                if data_geo.get('status') == 'OK' and data_geo.get('results'):
+                    vp = data_geo['results'][0].get('geometry', {}).get('viewport', {})
+                    ne = vp.get('northeast', {})
+                    sw = vp.get('southwest', {})
+                    if ne and sw:
+                        bbox = (sw.get('lng'), sw.get('lat'), ne.get('lng'), ne.get('lat'))
+
+            where_parts = ["geometry IS NOT NULL"]
+            params: dict = {}
+            if point:
+                where_parts.append("ST_Contains(geometry, ST_SetSRID(ST_Point(:lng, :lat), 4326))")
+                params["lng"] = point[0]
+                params["lat"] = point[1]
+            elif bbox:
+                where_parts.append("ST_Intersects(geometry, ST_MakeEnvelope(:xmin, :ymin, :xmax, :ymax, 4326))")
+                params["xmin"] = bbox[0]
+                params["ymin"] = bbox[1]
+                params["xmax"] = bbox[2]
+                params["ymax"] = bbox[3]
+            elif state and str(state).strip():
+                where_parts.append("(UPPER(TRIM(state)) = UPPER(TRIM(:state_filter)) OR state = :state_fips)")
+                params["state_filter"] = str(state).strip()
+                _STATE_FIPS = {"NC": "37", "SC": "45", "VA": "51", "GA": "13", "TN": "47"}
+                params["state_fips"] = _STATE_FIPS.get(str(state).strip().upper(), str(state).strip())
+            else:
+                db.close()
+                return jsonify({"error": "No geographic search (city, zip, or address) provided"}), 400
+
+            # Add filters (same as get_census_block_groups)
+            if min_income is not None:
+                where_parts.append("average_household_income >= :min_income")
+                params["min_income"] = min_income
+            if max_income is not None:
+                where_parts.append("average_household_income <= :max_income")
+                params["max_income"] = max_income
+            if min_population is not None:
+                where_parts.append("population >= :min_population")
+                params["min_population"] = min_population
+            if max_population is not None:
+                where_parts.append("population <= :max_population")
+                params["max_population"] = max_population
+            if min_age is not None:
+                where_parts.append("median_age >= :min_age")
+                params["min_age"] = min_age
+            if max_age is not None:
+                where_parts.append("median_age <= :max_age")
+                params["max_age"] = max_age
+            if min_zoned_elementary_school_rating is not None:
+                where_parts.append("se.rating IS NOT NULL AND se.rating >= :min_zoned_elementary_school_rating")
+                params["min_zoned_elementary_school_rating"] = min_zoned_elementary_school_rating
+            if min_zoned_blended_school_rating is not None:
+                where_parts.append(
+                    "se.rating IS NOT NULL AND sm.rating IS NOT NULL AND sh.rating IS NOT NULL "
+                    "AND (se.rating + sm.rating + sh.rating) / 3.0 >= :min_zoned_blended_school_rating"
+                )
+                params["min_zoned_blended_school_rating"] = min_zoned_blended_school_rating
+            if min_local_employment_score is not None:
+                where_parts.append("cbg.local_employment_score IS NOT NULL AND cbg.local_employment_score >= :min_local_employment_score")
+                params["min_local_employment_score"] = min_local_employment_score
+            if min_employment_access_score is not None:
+                where_parts.append("cbg.employment_access_score IS NOT NULL AND cbg.employment_access_score >= :min_employment_access_score")
+                params["min_employment_access_score"] = min_employment_access_score
+            if (point or bbox) and state and str(state).strip():
+                where_parts.append("(UPPER(TRIM(state)) = UPPER(TRIM(:state_filter)) OR state = :state_fips)")
+                params["state_filter"] = str(state).strip()
+                _STATE_FIPS = {"NC": "37", "SC": "45", "VA": "51", "GA": "13", "TN": "47"}
+                params["state_fips"] = _STATE_FIPS.get(str(state).strip().upper(), str(state).strip())
+
+            where_sql = " AND ".join(where_parts)
+            params["lim"] = limit
+            qualified_where = where_sql
+            for col in ("geometry", "state", "average_household_income", "population", "median_age"):
+                qualified_where = re.sub(rf"\b{col}\b", f"cbg.{col}", qualified_where)
+
+            # Execute query (same as get_census_block_groups)
+            data_sql = text(f"""
+                SELECT cbg.id, cbg.geoid, cbg.state, cbg.county, cbg.tract, cbg.block_group, cbg.population, cbg.median_age,
+                       cbg.average_household_income, cbg.total_households, cbg.data_year,
+                       cbg.local_employment_score, cbg.employment_access_score,
+                       ST_AsGeoJSON(cbg.geometry)::json AS geometry,
+                       z.zoned_elementary_school_id, z.zoned_middle_school_id, z.zoned_high_school_id,
+                       se.name AS zoned_elementary_school_name, se.rating AS zoned_elementary_school_rating,
+                       sm.name AS zoned_middle_school_name, sm.rating AS zoned_middle_school_rating,
+                       sh.name AS zoned_high_school_name, sh.rating AS zoned_high_school_rating
+                FROM census_block_groups cbg
+                LEFT JOIN census_block_group_zoned_schools z ON z.geoid = cbg.geoid
+                LEFT JOIN schools se ON se.id = z.zoned_elementary_school_id
+                LEFT JOIN schools sm ON sm.id = z.zoned_middle_school_id
+                LEFT JOIN schools sh ON sh.id = z.zoned_high_school_id
+                WHERE {qualified_where}
+                ORDER BY cbg.population DESC NULLS LAST
+                LIMIT :lim
+            """)
+            rows = db.execute(data_sql, params).fetchall()
+
+            # Convert rows to dicts (same as get_census_block_groups)
+            data = []
+            for row in rows:
+                if hasattr(row, "_mapping"):
+                    d = dict(row._mapping)
+                else:
+                    d = dict(zip(
+                        ["id", "geoid", "state", "county", "tract", "block_group", "population", "median_age",
+                         "average_household_income", "total_households", "data_year", 
+                         "local_employment_score", "employment_access_score", "geometry",
+                         "zoned_elementary_school_id", "zoned_middle_school_id", "zoned_high_school_id",
+                         "zoned_elementary_school_name", "zoned_elementary_school_rating",
+                         "zoned_middle_school_name", "zoned_middle_school_rating",
+                         "zoned_high_school_name", "zoned_high_school_rating"], row))
+                d["zip_code"] = None
+                if "local_employment_score" not in d:
+                    d["local_employment_score"] = None
+                if "employment_access_score" not in d:
+                    d["employment_access_score"] = None
+                from decimal import Decimal
+                les_val = d.get("local_employment_score")
+                if les_val is not None:
+                    try:
+                        if isinstance(les_val, Decimal):
+                            d["local_employment_score"] = float(les_val)
+                        elif isinstance(les_val, (int, float)):
+                            d["local_employment_score"] = float(les_val)
+                        elif isinstance(les_val, str) and les_val.strip():
+                            d["local_employment_score"] = float(les_val)
+                        else:
+                            d["local_employment_score"] = None
+                    except (ValueError, TypeError):
+                        d["local_employment_score"] = None
+                else:
+                    d["local_employment_score"] = None
+                eas_val = d.get("employment_access_score")
+                if eas_val is not None:
+                    try:
+                        if isinstance(eas_val, Decimal):
+                            d["employment_access_score"] = float(eas_val)
+                        elif isinstance(eas_val, (int, float)):
+                            d["employment_access_score"] = float(eas_val)
+                        elif isinstance(eas_val, str) and eas_val.strip():
+                            d["employment_access_score"] = float(eas_val)
+                        else:
+                            d["employment_access_score"] = None
+                    except (ValueError, TypeError):
+                        d["employment_access_score"] = None
+                else:
+                    d["employment_access_score"] = None
+                data.append(d)
+
+            total = len(data)
+            db.close()
+        except Exception as e:
+            try:
+                db.close()
+            except Exception:
+                pass
+            return jsonify({"error": f"Failed to fetch block groups: {str(e)}"}), 500
+
+        if not data:
+            return jsonify({
+                "error": "No block groups to export. Search by city, zip, or address and apply filters first."
+            }), 400
+
+        if fmt == 'geojson':
+            features = []
+            for row in data:
+                geom = row.get('geometry')
+                if not geom:
+                    continue
+                props = {k: v for k, v in row.items() if k != 'geometry' and v is not None}
+                features.append({"type": "Feature", "geometry": geom, "properties": props})
+            fc = {"type": "FeatureCollection", "features": features}
+            buf = io.BytesIO()
+            import json
+            buf.write(json.dumps(fc, separators=(',', ':')).encode('utf-8'))
+            buf.seek(0)
+            from datetime import datetime
+            filename = f"block_groups_export_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.geojson"
+            return send_file(
+                buf,
+                mimetype='application/geo+json',
+                as_attachment=True,
+                download_name=filename
+            )
+
+        # format=shapefile: build ZIP with .shp, .shx, .dbf, .prj (LandVision: no nested folder, WGS84)
+        try:
+            import shapefile
+        except ImportError:
+            return jsonify({"error": "shapefile export requires pyshp (pip install pyshp)"}), 500
+
+        import tempfile
+        import os
+        tmpdir = tempfile.mkdtemp()
+        base = os.path.join(tmpdir, 'block_groups')
+        # pyshp 3.x: must pass target filepath (no extension)
+        w = shapefile.Writer(target=base, shapeType=shapefile.POLYGON)
+        w.autoBalance = 1
+        # LandVision / DBF: 10-char field names
+        w.field('geoid', 'C', size=12)
+        w.field('tract', 'C', size=10)
+        w.field('blk_grp', 'C', size=2)
+        w.field('pop', 'N', size=8)
+        w.field('med_age', 'N', size=6, decimal=1)
+        w.field('mhi', 'N', size=10)
+        w.field('elem_r', 'N', size=4, decimal=1)
+        w.field('mid_r', 'N', size=4, decimal=1)
+        w.field('high_r', 'N', size=4, decimal=1)
+        w.field('les', 'N', size=4, decimal=2)
+        w.field('eas', 'N', size=4, decimal=2)
+
+        poly_count = 0
+        for row in data:
+            geom = row.get('geometry')
+            if not geom:
+                continue
+            parts = _geojson_geom_to_shapefile_parts(geom)
+            if not parts:
+                continue
+            w.poly(parts)
+            re_ = row.get('zoned_elementary_school_rating')
+            rm_ = row.get('zoned_middle_school_rating')
+            rh_ = row.get('zoned_high_school_rating')
+            les_ = row.get('local_employment_score')
+            eas_ = row.get('employment_access_score')
+            # Use 0 for missing numerics so DBF has no nulls (LandVision shape loader can fail on null)
+            w.record(
+                (row.get('geoid') or '')[:12],
+                (row.get('tract') or '')[:10],
+                (row.get('block_group') or '')[:2],
+                int(row.get('population') or 0),
+                round(float(row.get('median_age') or 0), 1),
+                int(row.get('average_household_income') or 0),
+                round(float(re_), 1) if re_ is not None else 0,
+                round(float(rm_), 1) if rm_ is not None else 0,
+                round(float(rh_), 1) if rh_ is not None else 0,
+                round(float(les_), 2) if les_ is not None else 0,
+                round(float(eas_), 2) if eas_ is not None else 0,
+            )
+            poly_count += 1
+
+        if poly_count == 0:
+            try:
+                for ext in ('.shp', '.shx', '.dbf', '.prj'):
+                    p = base + ext
+                    if os.path.isfile(p):
+                        os.remove(p)
+            except Exception:
+                pass
+            try:
+                os.rmdir(tmpdir)
+            except Exception:
+                pass
+            return jsonify({
+                "error": "No block group geometries could be converted to shapefile. Try a different search."
+            }), 400
+
+        w.close()
+        try:
+            # Add .prj for WGS84 (LandVision expects it)
+            prj_path = base + '.prj'
+            wkt = 'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]'
+            with open(prj_path, 'w') as f:
+                f.write(wkt)
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_STORED) as zf:
+                for ext in ('.shp', '.shx', '.dbf', '.prj'):
+                    path = base + ext
+                    if os.path.isfile(path):
+                        zf.write(path, os.path.basename(path))
+            zip_bytes = zip_buf.getvalue()
+            if len(zip_bytes) < 100:
+                return jsonify({"error": "Generated ZIP is too small; shapefile may be invalid."}), 500
+            from datetime import datetime
+            filename = f"block_groups_landvision_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.zip"
+            from flask import Response
+            resp = Response(zip_bytes, mimetype='application/zip')
+            resp.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+            resp.headers['Content-Length'] = len(zip_bytes)
+            return resp
+        finally:
+            try:
+                for ext in ('.shp', '.shx', '.dbf', '.prj'):
+                    p = base + ext
+                    if os.path.isfile(p):
+                        os.remove(p)
+            except Exception:
+                pass
+            try:
+                os.rmdir(tmpdir)
+            except Exception:
+                pass
+
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] census-block-groups/export: {e}\n{traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
 
 
 @api.route('/debug/zoned-schools', methods=['GET'])
