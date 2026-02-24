@@ -1,0 +1,15 @@
+# Render Blueprint (optional). Use Dashboard "New > Web Service" + connect repo for step-by-step.
+services:
+  - type: web
+    name: data-site-selection
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app
+    healthCheckPath: /ping
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: FLASK_DEBUG
+        value: "false"

@@ -40,3 +40,6 @@ class Config:
     CENSUS_YEAR = '2024'  # ACS 5-year estimates (2020-2024)
     CENSUS_DATASET = 'acs/acs5'  # American Community Survey 5-year
 
+    # Public URL for this app (e.g. https://your-app.onrender.com). Set in production.
+    BASE_URL = os.getenv('BASE_URL', '').rstrip('/')
+

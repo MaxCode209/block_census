@@ -8,8 +8,17 @@ app = Flask(__name__,
             static_folder='frontend/static')
 app.config.from_object(Config)
 
-# Port we run on (for absolute URLs in export so browser hits this server)
-EXPORT_BASE_URL = 'http://127.0.0.1:5001'
+def _export_base_url():
+    """Base URL for the app (for templates). In production set BASE_URL env; else use request."""
+    if getattr(Config, 'BASE_URL', None):
+        return Config.BASE_URL.rstrip('/')
+    try:
+        from flask import request
+        if request and request.url_root:
+            return request.url_root.rstrip('/')
+    except RuntimeError:
+        pass
+    return 'http://127.0.0.1:5001'
 
 # Enable CORS for API endpoints
 CORS(app)
@@ -58,7 +67,7 @@ def index():
     """Serve the main map interface."""
     return render_template('index.html', 
                          google_maps_api_key=Config.GOOGLE_MAPS_API_KEY,
-                         export_base_url=EXPORT_BASE_URL)
+                         export_base_url=_export_base_url())
 
 @app.route('/ping')
 def ping():
