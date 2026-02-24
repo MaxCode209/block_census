@@ -50,6 +50,7 @@ Add these (use **Add Environment Variable** for each):
 
 | Key | Value | Required |
 |-----|--------|----------|
+| `PYTHON_VERSION` | `3.12.0` | **Yes** — avoids Python 3.14, which breaks pandas/numpy build. |
 | `DATABASE_URL` | Your Supabase (or Postgres) connection string. Use **Transaction** pooler port **6543** for Supabase. | Yes |
 | `GOOGLE_MAPS_API_KEY` | Your Google Maps API key. | Yes |
 | `FLASK_DEBUG` | `false` | Yes (production) |
@@ -114,6 +115,7 @@ Add any other vars your app reads from `config` (e.g. `CENSUS_API_KEY`, `APIFY_A
 
 ## Troubleshooting
 
+- **Build fails with pandas/Cython errors (e.g. `_PyLong_AsByteArray`, `Python-3.14`):** Render is using Python 3.14, which pandas doesn’t support yet. Add environment variable **`PYTHON_VERSION`** = **`3.12.0`**, save, and **Redeploy** (Manual Deploy → Deploy latest commit). Ensure `runtime.txt` in the repo contains `python-3.12.0`.
 - **Build fails:** Check **Logs** for the build step. Common: missing dependency in `requirements.txt`, wrong Python version (we use 3.12 in `runtime.txt`).
 - **App crashes at start:** Check **Logs** after start. Common: missing or wrong `DATABASE_URL`, or DB not allowing connections from Render’s IPs (Supabase allows all by default).
 - **Map blank or “API key invalid”:** Add your Render URL to the Google Maps key restrictions (referrers) in Google Cloud Console.

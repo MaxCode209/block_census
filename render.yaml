@@ -7,6 +7,8 @@ services:
     startCommand: gunicorn --bind 0.0.0.0:$PORT app:app
     healthCheckPath: /ping
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
       - key: DATABASE_URL
         sync: false
       - key: GOOGLE_MAPS_API_KEY
